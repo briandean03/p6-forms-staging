@@ -1,0 +1,5221 @@
+import { useState, useEffect, useMemo, useRef, useCallback, memo, createContext, useContext, type Dispatch, type SetStateAction } from 'react'
+import { flushSync } from 'react-dom'
+import {
+  BarChart, Bar, LineChart, Line, PieChart, Pie, Cell,
+  XAxis, YAxis, CartesianGrid, Tooltip, Legend, ResponsiveContainer, AreaChart, Area,
+  ReferenceLine, LabelList,
+} from 'recharts'
+import { dashboardDesignStyle, designObject, designNumber, type DesignSpec } from '@/lib/dashboardDesign'
+import { schemaClient } from '@/lib/supabase'
+import { useNotification } from '@/hooks/useNotification'
+import { Notification } from '@/components/Notification'
+import { LoadingSpinner } from '@/components/LoadingSpinner'
+
+// ── Types ─────────────────────────────────────────────────────────────────────
+
+interface StructurePlanWidget {
+  widget_id: string
+  widget_type: string
+  title?: string
+  display_order?: number
+  include_in_a3_export?: boolean
+  grid?: { column_span?: number; row_span?: number; preferred_width?: string }
+}
+
+// Region from a3_layout.layout.regions
+interface A3Region {
+  region_id: string
+  title: string
+  region_order: number
+  column_span: number
+  row_span: number
+  widget_ids: string[]
+  presentation_mode: string
+  band?: string
+  grid_column?: number
+  grid_row?: number
+  global_grid_row?: number
+  height_mm?: number
+  presentation_selection?: { maximum_items?: number; selected_trade_codes?: string[] }
+}
+
+// Top-level a3_layout column
+interface A3Layout {
+  document_type?: string
+  layout_version?: string
+  paper?: {
+    size?: string
+    width_mm?: number
+    height_mm?: number
+    orientation?: string
+    margins_mm?: { top?: number; left?: number; right?: number; bottom?: number }
+  }
+  footer?: {
+    show_data_date?: boolean
+    show_report_id?: boolean
+    show_project_id?: boolean
+    show_design_version?: boolean
+  }
+  layout?: {
+    columns?: number
+    regions?: A3Region[]
+  }
+  dashboard_context?: {
+    schema?: string
+    week_num?: number
+    data_date?: string
+    design_id?: string
+    report_id?: string
+    project_id?: string
+    report_type?: string
+    structure_id?: string
+    design_version?: string
+    dashboard_title?: string
+    structure_version?: string
+  }
+  planning_metadata?: {
+    selected_widget_ids?: string[]
+    omitted_widget_ids?: string[]
+    non_widget_region_ids?: string[]
+  }
+}
+
+interface DashboardStructure {
+  design_id?: string | null
+  structure_id: string
+  report_id: string | null
+  project_id: string | null
+  week_num: number | null
+  data_date: string | null
+  dashboard_title: string | null
+  // pages use { page_id, title, page_order, ... } — note "title" not "page_title"
+  structure_plan: { pages?: StructurePlanPage[] } | null
+  a3_layout: A3Layout | null
+  processing_status: string | null
+  is_approved: boolean | null
+}
+
+interface StructurePlanPage {
+  page_id: string
+  page_key?: string
+  title: string        // the JSON field is "title", not "page_title"
+  page_order: number
+  subtitle?: string
+  widgets?: StructurePlanWidget[]
+}
+
+interface DashboardWidget {
+  widget_record_id: string
+  structure_id: string | null
+  page_id: string | null
+  widget_id: string | null
+  widget_order: number | null
+  widget_title: string | null
+  widget_type: string | null
+  widget_ast: Record<string, unknown> | null
+}
+
+interface DashboardDesign {
+  design_id: string
+  design_name: string
+  design_version: string
+  design_specification: Record<string, unknown>
+  is_approved: boolean
+  is_default: boolean
+}
+
+// ── Design token resolver ─────────────────────────────────────────────────────
+
+// Builds a token→hex lookup from design_specification.color_tokens
+// e.g. tok('primary') → '#5741DF', tok('surface_primary') → '#FFFFFF'
+function buildTokenResolver(spec: DesignSpec) {
+  const tokens = designObject(spec.color_tokens)
+  const resolve = (name: string, fallback = '#6b7280'): string => {
+    const token = tokens[name]
+    const value = typeof token === 'string' ? token : designObject(token).hex
+    return typeof value === 'string' && /^#[0-9a-f]{3,8}$/i.test(value) ? value : fallback
+  }
+  return Object.assign(resolve, { spec })
+}
+
+// Default fallback resolver used before design loads (matches current hardcoded values)
+const DEFAULT_TOK = buildTokenResolver({
+  color_tokens: {
+    surface_primary:  { hex: '#ffffff' },
+    canvas:           { hex: '#f1f5f9' },
+    subtle_border:    { hex: '#e2e8f0' },
+    text_primary:     { hex: '#1e293b' },
+    text_secondary:   { hex: '#64748b' },
+    muted_text:       { hex: '#94a3b8' },
+    primary:          { hex: '#3b82f6' },
+    mint:             { hex: '#10b981' },
+    warning:          { hex: '#f59e0b' },
+    critical:         { hex: '#ef4444' },
+    success:          { hex: '#10b981' },
+    shadow_card:      { hex: 'transparent' },
+  },
+})
+
+// Context that carries the active token resolver to all sub-components
+const DesignContext = createContext<ReturnType<typeof buildTokenResolver>>(DEFAULT_TOK)
+
+// ── Helpers ───────────────────────────────────────────────────────────────────
+
+
+function fmtDate(d: string | null | undefined) {
+  if (!d) return '—'
+  try {
+    return new Date(d).toLocaleDateString('en-GB', { day: 'numeric', month: 'short', year: 'numeric' })
+  } catch { return String(d) }
+}
+
+function fmtNum(v: unknown, decimals = 1): string {
+  if (v == null) return '—'
+  const n = Number(v)
+  if (isNaN(n)) return String(v)
+  const rounded = n % 1 === 0 ? n : parseFloat(n.toFixed(decimals))
+  return rounded.toLocaleString('en-US', { maximumFractionDigits: decimals })
+}
+
+// Compact axis-tick formatter: 2400000 → "2.4M", 600000 → "600k"
+function fmtAxis(v: unknown): string {
+  const n = Number(v)
+  if (isNaN(n)) return String(v)
+  const abs = Math.abs(n)
+  if (abs >= 1_000_000) return `${parseFloat((n / 1_000_000).toFixed(1))}M`
+  if (abs >= 10_000)    return `${parseFloat((n / 1_000).toFixed(1))}k`
+  return n.toLocaleString('en-US', { maximumFractionDigits: 1 })
+}
+
+// Whole-number formatter — rounds to nearest integer with comma separators
+function fmtInt(v: unknown): string {
+  if (v == null) return '—'
+  const n = Number(v)
+  if (isNaN(n)) return String(v)
+  return Math.round(n).toLocaleString('en-US')
+}
+
+// Returns true if the unit string indicates a quantity that should display as a whole number
+function isWorkerUnit(unit: string | null | undefined): boolean {
+  if (!unit) return false
+  const u = unit.toLowerCase()
+  return [
+    'worker', 'workers', 'manpower', 'headcount', 'persons', 'person', 'people', 'staff', 'head',
+    'manhour', 'manhours', 'man-hour', 'man-hours', 'mh',
+    'hour', 'hours',
+    'day', 'days',
+    'float',
+  ].some(k => u.includes(k))
+}
+
+// Context that carries the current report's Data Date (ISO string) to all chart widgets
+const DataDateContext = createContext<string>('')
+
+// Compact context — true when widgets are rendering inside the A3 single-page layout
+// Chart widgets reduce their height to fit the dense A3 grid
+const CompactContext = createContext<boolean>(false)
+
+// Find the x-axis label value in chart data whose date is closest to the given dataDate ISO string
+function findDataDateLabel(
+  data: Record<string, unknown>[],
+  xKey: string,
+  labelKey: string,
+  dataDate: string,
+): string | number | null {
+  if (!dataDate || !data.length) return null
+  const target = new Date(dataDate).getTime()
+  if (isNaN(target)) return null
+  let best: string | number | null = null
+  let bestDiff = Infinity
+  for (const row of data) {
+    const axisValue = row[labelKey] ?? row[xKey]
+    const raw = String(axisValue ?? '')
+    // Weekly axes can display W54 or W54 · 27-Sep-2026 rather than an ISO date.
+    // Resolve through the row's date, but return the original category value.
+    const weeklyAxis = /period|week|date|month|time/i.test(xKey) || /^W\d+/i.test(raw)
+    if (!weeklyAxis && !/^\d{4}[-/]\d{2}[-/]\d{2}/.test(raw)) continue
+    const dateValue = weeklyAxis
+      ? row.period_end ?? row.week_end ?? row.week_end_date ?? row.date ?? raw.split('·').slice(-1)[0].trim()
+      : raw
+    const t = typeof dateValue === 'string' ? new Date(dateValue).getTime() : NaN
+    if (!isNaN(t)) {
+      const diff = Math.abs(t - target)
+      if (diff < bestDiff) {
+        bestDiff = diff
+        best = typeof axisValue === 'number' ? axisValue : raw
+      }
+    }
+  }
+  return best
+}
+
+// ── Generic reusable sub-components ──────────────────────────────────────────
+
+function NoData({ msg = 'No data available' }: { msg?: string }) {
+  return <p className="text-xs text-gray-400 italic py-2">{msg}</p>
+}
+
+// Generic table — handles any columns/rows shape
+// col spec: either a plain string key or { key, label } object
+type ColSpec = { key: string; label: string }
+
+function toColSpecs(columns: unknown[]): ColSpec[] {
+  return columns.map(c => {
+    if (typeof c === 'string') return { key: c, label: c.replace(/_/g, ' ') }
+    if (c != null && typeof c === 'object') {
+      const o = c as Record<string, unknown>
+      const key   = String(o.key   ?? o.field ?? o.name  ?? o.id    ?? '')
+      const label = String(o.label ?? o.title ?? o.header ?? key).replace(/_/g, ' ')
+      return { key, label }
+    }
+    return { key: String(c), label: String(c) }
+  }).filter(c => c.key)
+}
+
+// ── SortableTable — frozen header, sort, per-column filter ───────────────────
+
+type SortDir = 'asc' | 'desc' | null
+
+// Serialize cell values safely — avoids [object Object] for nested objects/arrays
+function renderCellValue(val: unknown): string {
+  if (val == null) return '—'
+  if (typeof val === 'string') return val
+  if (typeof val === 'number' || typeof val === 'boolean') return String(val)
+  if (Array.isArray(val)) return val.map(v => renderCellValue(v)).join(', ')
+  if (typeof val === 'object') {
+    // Try to extract a human-readable label from common status-object shapes
+    const obj = val as Record<string, unknown>
+    if (obj.label != null)  return String(obj.label)
+    if (obj.value != null)  return String(obj.value)
+    if (obj.status != null) return String(obj.status)
+    if (obj.name != null)   return String(obj.name)
+    // Fall back to compact JSON
+    try { return JSON.stringify(val) } catch { return String(val) }
+  }
+  return String(val)
+}
+
+function SortableTable({
+  columns,
+  rows,
+  accentHeader = false,
+}: {
+  columns: unknown[]
+  rows: Record<string, unknown>[]
+  accentHeader?: boolean
+}) {
+  const specs = useMemo(() => toColSpecs(columns), [columns])
+  const [sortKey, setSortKey]   = useState<string | null>(null)
+  const [sortDir, setSortDir]   = useState<SortDir>(null)
+  const [filter, setFilter]     = useState('')
+  const [colFilter, setColFilter] = useState<string | null>(null)
+  const containerRef = useRef<HTMLDivElement>(null)
+
+  const filtered = useMemo(() => {
+    if (!filter.trim()) return rows
+    const q = filter.toLowerCase()
+    // If a column filter is active, only search that column
+    return rows.filter(row => {
+      if (colFilter) {
+        return renderCellValue(row[colFilter]).toLowerCase().includes(q)
+      }
+      return specs.some(({ key }) => renderCellValue(row[key]).toLowerCase().includes(q))
+    })
+  }, [rows, filter, colFilter, specs])
+
+  const sorted = useMemo(() => {
+    if (!sortKey || !sortDir) return filtered
+    return [...filtered].sort((a, b) => {
+      const av = a[sortKey], bv = b[sortKey]
+      // numeric sort if both parse as numbers
+      const an = Number(av), bn = Number(bv)
+      const numA = !isNaN(an) && av !== '' && av != null
+      const numB = !isNaN(bn) && bv !== '' && bv != null
+      let cmp = 0
+      if (numA && numB) {
+        cmp = an - bn
+      } else {
+        cmp = String(av ?? '').localeCompare(String(bv ?? ''), undefined, { numeric: true })
+      }
+      return sortDir === 'asc' ? cmp : -cmp
+    })
+  }, [filtered, sortKey, sortDir])
+
+  if (!specs.length || !rows.length) return <NoData />
+
+  function toggleSort(key: string) {
+    if (sortKey !== key) { setSortKey(key); setSortDir('asc'); return }
+    if (sortDir === 'asc') { setSortDir('desc'); return }
+    setSortKey(null); setSortDir(null)
+  }
+
+  const SortIcon = ({ col }: { col: string }) => {
+    if (sortKey !== col) return (
+      <svg className="w-3 h-3 opacity-30" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+        <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M7 16V4m0 0L3 8m4-4l4 4m6 8v-8m0 8l4-4m-4 4l-4-4" />
+      </svg>
+    )
+    return sortDir === 'asc'
+      ? <svg className="w-3 h-3 text-blue-500" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M5 15l7-7 7 7" /></svg>
+      : <svg className="w-3 h-3 text-blue-500" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 9l-7 7-7-7" /></svg>
+  }
+
+  const thBase = accentHeader
+    ? 'px-3 py-2.5 text-left font-semibold text-red-600 uppercase tracking-wider whitespace-nowrap bg-red-50 text-[11px]'
+    : 'px-3 py-2.5 text-left font-semibold text-gray-500 uppercase tracking-wider whitespace-nowrap bg-gray-50 text-[11px]'
+
+  return (
+    <div className="flex flex-col min-h-0 h-full">
+      {/* Filter bar */}
+      <div className="no-print flex items-center gap-2 mb-2 flex-shrink-0">
+        <div className="relative flex-1">
+          <svg className="absolute left-2 top-1/2 -translate-y-1/2 w-3 h-3 text-gray-400" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+            <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M21 21l-4.35-4.35M17 11A6 6 0 115 11a6 6 0 0112 0z" />
+          </svg>
+          <input
+            type="text"
+            value={filter}
+            onChange={e => setFilter(e.target.value)}
+            placeholder="Filter rows…"
+            className="w-full pl-6 pr-2 py-1.5 text-xs border border-gray-200 rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-400 bg-white"
+          />
+        </div>
+        <select
+          value={colFilter ?? ''}
+          onChange={e => setColFilter(e.target.value || null)}
+          className="text-xs border border-gray-200 rounded-lg px-2 py-1.5 bg-white focus:outline-none focus:ring-2 focus:ring-blue-400 text-gray-600 max-w-[120px]"
+        >
+          <option value="">All columns</option>
+          {specs.map(({ key, label }) => (
+            <option key={key} value={key}>{label}</option>
+          ))}
+        </select>
+        {(filter || sortKey) && (
+          <button
+            onClick={() => { setFilter(''); setColFilter(null); setSortKey(null); setSortDir(null) }}
+            className="text-xs text-gray-400 hover:text-gray-700 px-1.5 py-1 rounded border border-gray-200 whitespace-nowrap"
+          >
+            Clear
+          </button>
+        )}
+        <span className="text-[11px] text-gray-400 whitespace-nowrap flex-shrink-0">
+          {sorted.length}/{rows.length} rows
+        </span>
+      </div>
+
+      {/* Table with frozen header */}
+      <div ref={containerRef} className="overflow-auto flex-1" style={{ maxHeight: '560px' }}>
+        <table className="min-w-full border-separate border-spacing-0" style={{ fontSize: 12 }}>
+          <thead>
+            <tr>
+              {specs.map(({ key, label }) => (
+                <th
+                  key={key}
+                  onClick={() => toggleSort(key)}
+                  className={`${thBase} sticky top-0 cursor-pointer select-none z-10`}
+                  style={{ boxShadow: '0 1px 0 #e5e7eb' }}
+                >
+                  <div className="flex items-center gap-1">
+                    <span>{label}</span>
+                    <SortIcon col={key} />
+                  </div>
+                </th>
+              ))}
+            </tr>
+          </thead>
+          <tbody className="divide-y divide-gray-100">
+            {sorted.length === 0 ? (
+              <tr>
+                <td colSpan={specs.length} className="px-3 py-4 text-center text-gray-400 italic text-xs">No matching rows</td>
+              </tr>
+            ) : sorted.map((row, idx) => (
+              <tr key={idx} className={`${idx % 2 === 0 ? 'bg-white' : 'bg-gray-50'} hover:bg-blue-50/40 transition-colors`}>
+                {specs.map(({ key }) => (
+                  <td key={key} className="px-3 py-2.5 text-gray-700 whitespace-nowrap">
+                    {renderCellValue(row[key])}
+                  </td>
+                ))}
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
+    </div>
+  )
+}
+
+// Derive columns automatically from first row keys
+function AutoTable({ rows, accentHeader }: { rows: Record<string, unknown>[]; accentHeader?: boolean }) {
+  if (!rows?.length) return <NoData />
+  const columns = Object.keys(rows[0])
+  return <SortableTable columns={columns} rows={rows} accentHeader={accentHeader} />
+}
+
+// ── Helpers to extract content safely ─────────────────────────────────────────
+
+// All widget_ast objects have shape { type, content: { ... } }
+// This unwraps the content layer.
+function getContent(ast: Record<string, unknown>): Record<string, unknown> {
+  const c = ast.content
+  if (c != null && typeof c === 'object' && !Array.isArray(c)) {
+    return c as Record<string, unknown>
+  }
+  // Fallback: treat ast itself as content (defensive)
+  return ast
+}
+
+// ── Widget renderers ──────────────────────────────────────────────────────────
+
+// Shared KPI item type used by kpi_card + kpi_group
+type KpiItem = {
+  label: string
+  value: unknown
+  unit?: string | null
+  status?: string | null
+  variance?: number | null
+  variance_unit?: string | null
+  comparison_label?: string | null
+  comparison_value?: number | null
+  data_type?: string
+}
+
+function severityColor(status: string | null | undefined) {
+  if (!status) return 'text-gray-500'
+  if (['critical', 'error', 'behind'].includes(status)) return 'text-red-500'
+  if (['overdue', 'warning'].includes(status)) return 'text-amber-600'
+  if (['ahead', 'ok', 'good', 'on_track'].includes(status)) return 'text-green-600'
+  if (status === 'neutral') return 'text-gray-500'
+  return 'text-gray-500'
+}
+
+function KpiCard({ item, bare }: { item: KpiItem; bare?: boolean }) {
+  const sColor = severityColor(item.status)
+  const variance = item.variance
+  const isWorker = isWorkerUnit(item.unit) || item.data_type === 'integer' || item.data_type === 'count'
+  const displayValue = item.value != null
+    ? (isWorker ? fmtInt(item.value) : (typeof item.value === 'number' || (typeof item.value === 'string' && !isNaN(Number(item.value)) && item.value.trim() !== '') ? fmtNum(item.value, 1) : String(item.value)))
+    : '—'
+  const inner = (
+    <>
+      <span className="dashboard-kpi-label text-[11px] font-semibold text-gray-400 uppercase tracking-wide truncate">{item.label}</span>
+      <span className="dashboard-kpi-value text-2xl font-bold mt-1 text-gray-900">
+        {displayValue}
+        {item.unit && <span className="text-sm font-normal text-gray-500 ml-1">{item.unit}</span>}
+      </span>
+      {item.comparison_label && (
+        <span className="text-[11px] text-gray-400 mt-1">
+          {item.comparison_label}{item.comparison_value != null ? `: ${isWorker ? fmtInt(item.comparison_value) : fmtNum(item.comparison_value)}${item.unit ? ' ' + item.unit : ''}` : ''}
+        </span>
+      )}
+      {variance != null && (
+        <span className={`text-[11px] font-semibold mt-1 ${variance >= 0 ? 'text-green-600' : 'text-red-500'}`}>
+          {variance >= 0 ? '+' : ''}{fmtNum(variance)}{item.variance_unit ? ' ' + item.variance_unit : (item.unit ? ' ' + item.unit : '')}
+        </span>
+      )}
+      {item.status && (
+        <span className={`text-[11px] font-semibold mt-1 capitalize ${sColor}`}>{item.status}</span>
+      )}
+    </>
+  )
+  if (bare) return <div className="flex flex-col">{inner}</div>
+  return <div className="flex flex-col rounded-lg px-4 py-3 bg-gray-50 border border-gray-100">{inner}</div>
+}
+
+// kpi_card — content.{ value, label, unit, status, variance, comparison_label, comparison_value }
+//            OR content.kpi.{ ... } (some variance widgets wrap kpi under content.kpi)
+function KpiCardWidget({ ast }: { ast: Record<string, unknown> }) {
+  const content = getContent(ast)
+  // Some cards put the main metric inside content.kpi
+  const raw = (content.kpi ?? content) as Record<string, unknown>
+  const item: KpiItem = {
+    label:            String(raw.label ?? ast.title ?? ''),
+    value:            raw.value,
+    unit:             raw.unit as string | null,
+    status:           raw.status as string | null,
+    variance:         raw.variance as number | null,
+    variance_unit:    raw.variance_unit as string | null,
+    comparison_label: raw.comparison_label as string | null,
+    comparison_value: raw.comparison_value as number | null,
+    data_type:        raw.data_type as string | undefined,
+  }
+  const primaryMetrics = content.primary_metrics as KpiItem[] | null
+  return (
+    <div className="space-y-2">
+      <KpiCard item={item} />
+      {primaryMetrics?.length ? (
+        <div className="grid grid-cols-2 gap-2">
+          {primaryMetrics.map((m, i) => <KpiCard key={i} item={m} />)}
+        </div>
+      ) : null}
+    </div>
+  )
+}
+
+// kpi_group — content.items[] OR content.kpis[] OR content.metrics[]
+// Some KPI items use actual_current_period/kpi instead of value/label.
+// content.empty_state: { title, message, hint } shown when data is unavailable.
+// Shared by the website and the compact PDF renderer so both accept the same
+// source fields and preserve identical values, units and comparison metadata.
+function normaliseKpiItems(rawItems: (KpiItem & Record<string, unknown>)[]) {
+  return rawItems.map(raw => ({
+    ...raw,
+    label:            (raw.label ?? raw.kpi ?? '') as string,
+    value:            raw.value ?? raw.actual_current_period ?? null,
+    unit:             raw.unit as string | null,
+    status:           raw.status as string | null,
+    variance:         raw.variance as number | null,
+    variance_unit:    raw.variance_unit as string | null,
+    comparison_label: (raw.comparison_label ?? (raw.planned_current_period != null ? 'Planned' : null)) as string | null,
+    comparison_value: (raw.comparison_value ?? raw.planned_current_period ?? null) as number | null,
+    data_type:        raw.data_type as string | undefined,
+  }))
+}
+
+function KpiGroupWidget({ ast }: { ast: Record<string, unknown> }) {
+  const content = getContent(ast)
+  const rawItems = (content.items ?? content.kpis ?? content.metrics) as (KpiItem & Record<string, unknown>)[] | null
+
+  // If all items have status "unavailable" or none exist, check for an empty_state
+  const emptyState = content.empty_state as { title?: string; message?: string; hint?: string } | null
+  const hasData = rawItems?.some(r => r.value != null && r.status !== 'unavailable')
+
+  if (!rawItems?.length || (!hasData && emptyState?.title)) {
+    return (
+      <div className="rounded-lg bg-gray-50 border border-gray-200 px-4 py-5 text-center space-y-1">
+        <p className="text-xs font-semibold text-gray-500">{emptyState?.title ?? 'No data available'}</p>
+        {emptyState?.message && <p className="text-xs text-gray-400 leading-relaxed">{emptyState.message}</p>}
+        {emptyState?.hint && <p className="text-[10px] text-gray-300 italic leading-relaxed mt-1">{emptyState.hint}</p>}
+      </div>
+    )
+  }
+
+  const items = normaliseKpiItems(rawItems)
+
+  return <KpiGroupSelectable items={items} />
+}
+
+// Selectable KPI group — pill row above, selected card highlighted with ring + accent border
+function KpiGroupSelectable({ items }: { items: KpiItem[] }) {
+  const tok = useContext(DesignContext)
+  const [selectedIdx, setSelectedIdx] = useState<number | null>(null)
+
+  // Colour accent per severity — used for the selected card ring and pill active state
+  const accentFor = (status: string | null | undefined) => {
+    if (!status) return { ring: tok('primary', '#3b82f6'), pill: tok('alert_info_bg', '#eff6ff'), pillText: '#1d4ed8', pillBorder: '#bfdbfe' }
+    if (['critical', 'error', 'behind'].includes(status))  return { ring: tok('critical', '#ef4444'), pill: tok('negative_bg', '#fef2f2'), pillText: '#b91c1c', pillBorder: '#fecaca' }
+    if (['overdue', 'warning'].includes(status))            return { ring: tok('warning', '#f59e0b'), pill: tok('warning_bg', '#fffbeb'), pillText: '#b45309', pillBorder: '#fde68a' }
+    if (['ahead', 'ok', 'good', 'on_track'].includes(status)) return { ring: tok('success', '#10b981'), pill: tok('positive_bg', '#f0fdf4'), pillText: '#15803d', pillBorder: '#bbf7d0' }
+    return { ring: tok('primary', '#3b82f6'), pill: tok('alert_info_bg', '#eff6ff'), pillText: '#1d4ed8', pillBorder: '#bfdbfe' }
+  }
+
+  return (
+    <div style={{ display: 'flex', flexDirection: 'column', gap: 10 }}>
+      {/* Pill selector row */}
+      <div style={{ display: 'flex', gap: 6, flexWrap: 'wrap' }}>
+        {items.map((item, i) => {
+          const ac = accentFor(item.status)
+          const isActive = selectedIdx === i
+          return (
+            <button
+              key={i}
+              onClick={() => setSelectedIdx(isActive ? null : i)}
+              style={{
+                fontSize: 11,
+                fontWeight: 600,
+                padding: '4px 10px',
+                borderRadius: 99,
+                border: `1px solid ${isActive ? ac.ring : '#e2e8f0'}`,
+                background: isActive ? ac.pill : '#f8fafc',
+                color: isActive ? ac.pillText : '#64748b',
+                cursor: 'pointer',
+                transition: 'all 0.15s',
+                outline: 'none',
+                whiteSpace: 'nowrap',
+              }}
+            >
+              {item.label}
+            </button>
+          )
+        })}
+      </div>
+
+      {/* KPI card grid — selected card gets ring + accent border-top */}
+      <div className="grid grid-cols-2 gap-2">
+        {items.map((item, i) => {
+          const isSelected = selectedIdx === i
+          const ac = accentFor(item.status)
+          return (
+            <div
+              key={i}
+              onClick={() => setSelectedIdx(isSelected ? null : i)}
+              className="dashboard-kpi-card"
+              style={{
+                cursor: 'pointer',
+                borderRadius: 8,
+                border: isSelected ? `2px solid ${ac.ring}` : `1px solid ${tok('subtle_border', '#e5e7eb')}`,
+                borderTop: isSelected ? `3px solid ${ac.ring}` : undefined,
+                background: isSelected ? ac.pill : tok('surface_primary', '#f8fafc'),
+                boxShadow: isSelected ? `0 0 0 3px ${ac.ring}22` : undefined,
+                transition: 'all 0.15s',
+                padding: '10px 14px',
+                display: 'flex',
+                flexDirection: 'column',
+              }}
+            >
+              <KpiCard item={item} bare />
+            </div>
+          )
+        })}
+      </div>
+    </div>
+  )
+}
+
+// metadata_panel — content.fields[] or content.items[]:
+//   { key, label, value, display_value?, status, emphasis, data_type }
+// emphasis: "primary" (col-span-2, large text) | "secondary" (normal, prominent) | "tertiary" (small, muted)
+function MetadataPanelWidget({ ast }: { ast: Record<string, unknown> }) {
+  const content = getContent(ast)
+  type Field = { key?: string; label: string; value: unknown; display_value?: unknown; status?: string; emphasis?: string; data_type?: string }
+  const fields = (content.fields ?? content.items) as Field[] | null
+  if (!fields?.length) return <NoData />
+  return (
+    <dl className="grid grid-cols-2 gap-x-6 gap-y-3">
+      {fields.map((f, i) => {
+        const isUnavailable = f.status === 'unavailable'
+        const isPrimary   = f.emphasis === 'primary'
+        const isTertiary  = f.emphasis === 'tertiary'
+        // Prefer display_value when present (e.g. "W17" instead of 17, or formatted date)
+        const display = f.display_value ?? f.value
+        return (
+          <div key={i} className={isPrimary ? 'col-span-2' : ''}>
+            <dt className={`text-[10px] font-semibold uppercase tracking-wide ${isTertiary ? 'text-gray-300' : 'text-gray-400'}`}>{f.label}</dt>
+            <dd className={`font-medium ${isPrimary ? 'text-base text-gray-900' : isTertiary ? 'text-xs text-gray-400' : 'text-sm text-gray-800'} ${isUnavailable ? 'italic opacity-50' : ''}`}>
+              {display != null ? String(display) : isUnavailable ? 'Unavailable' : '—'}
+            </dd>
+          </div>
+        )
+      })}
+    </dl>
+  )
+}
+
+// alert_panel — content.alerts[]: { alert_id, title|headline, severity, value, unit, summary|detail, metrics[] }
+function AlertPanelWidget({ ast }: { ast: Record<string, unknown> }) {
+  const content = getContent(ast)
+  type AlertMetric = { label: string; value: unknown; unit?: string | null }
+  type AlertItem = {
+    alert_id?: string
+    title?: string
+    headline?: string
+    label?: string
+    severity?: string
+    value?: number | null
+    unit?: string
+    summary?: string
+    detail?: string
+    metrics?: AlertMetric[]
+    // engineering exception fields (WGT-005 shape)
+    reference?: string
+    subject?: string
+    metric_label?: string
+    metric_value?: number | null
+    metric_unit?: string
+    date_label?: string
+    date_value?: string
+    document_class_label?: string
+    discipline?: string
+    exception_type?: string
+  }
+  const alerts = (content.alerts ?? content.items ?? content.exceptions) as AlertItem[] | null
+  if (!alerts?.length) return <NoData />
+
+  // Also render a top-level headline summary if present
+  const panelHeadline = content.headline as string | undefined
+
+  return (
+    <div className="space-y-2">
+      {panelHeadline && (
+        <p className="text-[11px] text-gray-600 leading-relaxed pb-1">{panelHeadline}</p>
+      )}
+      {alerts.map((alert, i) => {
+        const sev = alert.severity ?? 'warning'
+        const isCritical = sev === 'critical' || sev === 'error'
+        const isOverdue  = sev === 'overdue'
+        const rowCls = isCritical
+          ? 'bg-red-50 border-red-200'
+          : isOverdue
+          ? 'bg-orange-50 border-orange-200'
+          : 'bg-amber-50 border-amber-200'
+        const badgeCls = isCritical
+          ? 'bg-red-100 text-red-700'
+          : isOverdue
+          ? 'bg-orange-100 text-orange-700'
+          : 'bg-amber-100 text-amber-700'
+
+        // Resolve headline: prefer explicit title/headline/label, fall back to
+        // the engineering exception shape (reference + optional subject)
+        const headline = alert.title ?? alert.headline ?? alert.label
+          ?? (alert.reference
+            ? [alert.reference, alert.subject].filter(Boolean).join(' — ')
+            : '')
+
+        // Resolve detail text
+        const detail = alert.summary ?? alert.detail
+          ?? (alert.date_label && alert.date_value
+            ? `${alert.date_label}: ${alert.date_value}`
+            : undefined)
+
+        // Resolve numeric metric
+        const metricValue = alert.value ?? alert.metric_value
+        const metricUnit  = alert.unit  ?? alert.metric_unit
+
+        // Sub-chips for document class / discipline / metric label
+        const chips = [
+          alert.document_class_label,
+          alert.discipline,
+          alert.metric_label,
+        ].filter(Boolean)
+
+        return (
+          <div key={alert.alert_id ?? i} className={`rounded-lg border px-4 py-3 ${rowCls}`}>
+            <div className="flex items-start justify-between gap-2">
+              <p className="text-xs font-semibold text-gray-800 leading-snug flex-1">{headline}</p>
+              <div className="flex items-center gap-1.5 flex-shrink-0">
+                {metricValue != null && (
+                  <span className="text-base font-bold text-gray-900">{String(metricValue)}</span>
+                )}
+                {metricUnit && <span className="text-xs text-gray-500">{metricUnit}</span>}
+                <span className={`text-[10px] font-semibold px-1.5 py-0.5 rounded capitalize ${badgeCls}`}>{sev}</span>
+              </div>
+            </div>
+            {chips.length > 0 && (
+              <div className="flex flex-wrap gap-1.5 mt-1.5">
+                {chips.map((chip, j) => (
+                  <span key={j} className="text-[10px] px-1.5 py-0.5 rounded bg-white/70 border border-gray-200 text-gray-500">{chip}</span>
+                ))}
+              </div>
+            )}
+            {detail && (
+              <p className="text-xs text-gray-500 mt-1 leading-relaxed">{detail}</p>
+            )}
+            {alert.metrics && alert.metrics.length > 0 && (
+              <div className="mt-2 flex flex-wrap gap-x-4 gap-y-1">
+                {alert.metrics.map((m, j) => (
+                  <span key={j} className="text-[10px] text-gray-600">
+                    <span className="font-medium">{m.label}:</span>{' '}
+                    {m.value != null ? String(m.value) : '—'}
+                    {m.unit ? ` ${m.unit}` : ''}
+                  </span>
+                ))}
+              </div>
+            )}
+          </div>
+        )
+      })}
+    </div>
+  )
+}
+
+// status_summary — multiple content shapes:
+//   content.items[]:        { key, label, value|count, unit, semantic_status|status_semantic, reference_label, reference_value }
+//   content.statuses[]:     { label, value, unit, semantic_status, status_code, percentage_of_total }   (widget [32] QA/QC)
+//   content.metrics[]:      { key, label, value, unit, status, status_label, share_of_total_percent }   (widget [31] Aging)
+//   content.status_counts[]: fallback
+// Also renders content.breakdown.rows[] as a compact table when present.
+// Extended to handle engineering transmittal shape:
+//   content.headline_metrics[], content.status_distribution.statuses[], content.aging_metrics[]
+function StatusSummaryWidget({ ast }: { ast: Record<string, unknown> }) {
+  const content = getContent(ast)
+  console.log('[StatusSummaryWidget] full content:', JSON.stringify(content).slice(0, 800))
+  const tok = useContext(DesignContext)
+
+  type StatusItem = {
+    key?: string
+    label: string
+    value?: number | null
+    count?: number | null
+    unit?: string
+    status?: string
+    semantic_status?: string
+    status_semantic?: string
+    status_label?: string
+    reference_label?: string
+    reference_value?: number | null
+    share_of_total_percent?: number | null
+    percentage_of_total?: number | null
+  }
+
+  // ── Engineering transmittal variant ───────────────────────────────────────
+  const headlineMet = content.headline_metrics as StatusItem[] | null
+  const statusDist  = content.status_distribution as Record<string, unknown> | null
+  const agingMet    = content.aging_metrics as StatusItem[] | null
+
+  if (Array.isArray(headlineMet) && headlineMet.length) {
+    const distStatuses = Array.isArray(statusDist?.statuses)
+      ? (statusDist!.statuses as { status_code: string; status_label: string; count: number; share_percent: number }[])
+      : []
+
+    // Color map for engineering status codes
+    const statusCodeColor: Record<string, string> = {
+      A: tok('mint',     '#10b981'),
+      B: tok('primary',  '#3b82f6'),
+      C: tok('warning',  '#f59e0b'),
+      D: tok('critical', '#ef4444'),
+      UR: '#94a3b8',
+    }
+    const totalWithStatus = (statusDist?.total_with_recorded_status as number | null) ?? 1
+
+    return (
+      <div className="space-y-3">
+        {/* Headline metrics — 3-col grid */}
+        <div className="grid grid-cols-3 gap-2">
+          {headlineMet.map((item, i) => {
+            const val    = item.value ?? item.count
+            const sColor = severityColor(item.semantic_status ?? item.semantic_status)
+            return (
+              <div key={i} className="flex flex-col rounded-lg bg-gray-50 border border-gray-100 px-2 py-2">
+                <span className={`text-xl font-bold ${sColor}`}>{val != null ? fmtInt(val) : '—'}</span>
+                <span className="text-[9px] font-semibold text-gray-500 uppercase tracking-wide leading-tight mt-0.5">{item.label}</span>
+              </div>
+            )
+          })}
+        </div>
+
+        {/* Status distribution stacked bar */}
+        {distStatuses.length > 0 && (
+          <div className="space-y-1.5">
+            <p className="text-[9px] font-semibold text-gray-400 uppercase tracking-widest">Status Distribution</p>
+            <div className="flex h-3 rounded-full overflow-hidden w-full gap-px">
+              {distStatuses.map((s, i) => (
+                <div
+                  key={i}
+                  title={`${s.status_label}: ${s.count} (${fmtNum(s.share_percent, 1)}%)`}
+                  style={{
+                    width: `${(s.count / totalWithStatus) * 100}%`,
+                    background: statusCodeColor[s.status_code] ?? '#cbd5e1',
+                    minWidth: s.count > 0 ? 2 : 0,
+                  }}
+                />
+              ))}
+            </div>
+            {/* Legend */}
+            <div className="flex flex-wrap gap-x-3 gap-y-0.5">
+              {distStatuses.map((s, i) => (
+                <div key={i} className="flex flex-wrap items-center gap-1 min-w-0">
+                  <div className="w-2 h-2 rounded-sm flex-shrink-0" style={{ background: statusCodeColor[s.status_code] ?? '#cbd5e1' }} />
+                  <span className="text-[9px] text-gray-500">{s.status_label} <span className="font-semibold text-gray-700">{s.count}</span></span>
+                </div>
+              ))}
+            </div>
+          </div>
+        )}
+
+        {/* Aging metrics */}
+        {Array.isArray(agingMet) && agingMet.length > 0 && (
+          <div className="space-y-1">
+            <p className="text-[9px] font-semibold text-gray-400 uppercase tracking-widest">Aging Alerts</p>
+            <div className="space-y-1">
+              {agingMet.map((item, i) => {
+                const val    = item.value ?? item.count
+                const sColor = severityColor(item.semantic_status)
+                return (
+                  <div key={i} className="flex items-center justify-between bg-amber-50 border border-amber-100 rounded-lg px-2.5 py-1.5">
+                    <span className="text-[10px] text-gray-600">{item.label}</span>
+                    <span className={`text-sm font-bold ${sColor}`}>{val != null ? fmtInt(val) : '—'}</span>
+                  </div>
+                )
+              })}
+            </div>
+          </div>
+        )}
+      </div>
+    )
+  }
+
+  // ── Categories variant — content.categories[]: { label, open, closed, total, status } ────
+  const cats = content.categories as { label?: string; open?: number; closed?: number; total?: number; status?: string }[] | null
+  if (Array.isArray(cats) && cats.length) {
+    return (
+      <div className="space-y-1.5">
+        {cats.map((cat, i) => {
+          const total  = cat.total ?? ((cat.open ?? 0) + (cat.closed ?? 0))
+          const sColor = severityColor(cat.status)
+          return (
+            <div key={i} className="flex items-center justify-between rounded-lg bg-gray-50 border border-gray-100 px-3 py-2 gap-3">
+              <span className="text-[11px] font-semibold text-gray-600 truncate">{cat.label}</span>
+              <div className="flex items-center gap-2 flex-shrink-0 text-[11px]">
+                {cat.open != null && <span className="text-red-500 font-bold">{fmtInt(cat.open)} open</span>}
+                {cat.closed != null && <span className="text-green-600 font-semibold">{fmtInt(cat.closed)} closed</span>}
+                {total != null && <span className={`font-bold ${sColor}`}>{fmtInt(total)}</span>}
+              </div>
+            </div>
+          )
+        })}
+      </div>
+    )
+  }
+
+  // ── Movement variant — content.movement.movement_categories[]: { label, count, status, records[] } ──
+  const movement = content.movement as Record<string, unknown> | null
+  const movCats  = movement?.movement_categories as { label?: string; count?: number; status?: string; records?: unknown[] }[] | null
+  if (Array.isArray(movCats) && movCats.length) {
+    return (
+      <div className="space-y-1.5">
+        {movCats.map((cat, i) => {
+          const sColor = severityColor(cat.status)
+          return (
+            <div key={i} className="flex items-center justify-between rounded-lg bg-gray-50 border border-gray-100 px-3 py-2">
+              <span className="text-[11px] font-semibold text-gray-600 truncate">{cat.label}</span>
+              <span className={`text-lg font-bold ${sColor}`}>{cat.count != null ? fmtInt(cat.count) : '—'}</span>
+            </div>
+          )
+        })}
+      </div>
+    )
+  }
+
+  // ── Generic / original variant ─────────────────────────────────────────────
+  const raw = (content.items ?? content.statuses ?? content.metrics ?? content.status_counts) as StatusItem[] | null
+  if (!raw?.length) return <NoData />
+
+  const breakdownRows = ((content.breakdown as Record<string, unknown> | null)?.rows) as Record<string, unknown>[] | null
+  const breakdownCols = ((content.breakdown as Record<string, unknown> | null)?.columns) as { key: string; label: string }[] | null
+
+  return (
+    <div className="space-y-2">
+      <div className="grid grid-cols-2 gap-2">
+        {raw.map((item, i) => {
+          const displayValue = item.value ?? item.count
+          const statusKey    = item.status ?? item.semantic_status ?? item.status_semantic
+          const sColor       = severityColor(statusKey)
+          const subLabel     = item.status_label ?? (item.share_of_total_percent != null ? `${fmtNum(item.share_of_total_percent, 1)}% of total` : null) ?? (item.percentage_of_total != null ? `${fmtNum(item.percentage_of_total, 1)}%` : null)
+          return (
+            <div key={i} className="flex flex-col rounded-lg bg-gray-50 border border-gray-200 px-3 py-2">
+              <span className={`text-2xl font-bold ${sColor}`}>{displayValue != null ? String(displayValue) : '—'}</span>
+              {item.unit && <span className="text-[10px] text-gray-400">{item.unit}</span>}
+              <span className="text-[10px] font-semibold text-gray-500 uppercase tracking-wide mt-0.5 leading-tight">{item.label}</span>
+              {subLabel && <span className="text-[10px] text-gray-400 mt-0.5">{subLabel}</span>}
+              {item.reference_label && item.reference_value != null && (
+                <span className="text-[10px] text-gray-400 mt-0.5">of {item.reference_value} {item.reference_label.toLowerCase()}</span>
+              )}
+            </div>
+          )
+        })}
+      </div>
+      {breakdownRows?.length ? (
+        <SortableTable
+          columns={breakdownCols?.length ? breakdownCols : Object.keys(breakdownRows[0])}
+          rows={breakdownRows}
+        />
+      ) : null}
+    </div>
+  )
+}
+
+// ── trade_schedule_gantt ───────────────────────────────────────────────────────
+// content.trades[]: { trade_code, trade_label, planned.{cumulative_percent_complete},
+//                     actual.{cumulative_percent_complete, status}, variance.{...} }
+function TradeScheduleGanttWidget({ ast }: { ast: Record<string, unknown> }) {
+  const content = getContent(ast)
+  const tok = useContext(DesignContext)
+
+  type Trade = {
+    trade_code: string
+    trade_label: string
+    trade_name?: string | null
+    planned: { cumulative_percent_complete: number; start?: string | null; finish?: string | null }
+    actual:  { cumulative_percent_complete: number; status?: string; start?: string | null; finish?: string | null }
+    variance: { start_variance_days?: number | null; finish_variance_days?: number | null }
+  }
+
+  const trades = Array.isArray(content.trades) ? (content.trades as Trade[]) : []
+  if (!trades.length) return <NoData />
+
+  const plannedColor = tok('primary',      '#9B8ADC')
+  const actualColor  = tok('mint',         '#4FAE91')
+  const bgTrack      = tok('canvas',       '#f1f5f9')
+
+  return (
+    <div data-widget="trade-schedule" className="space-y-1.5 overflow-y-auto max-h-96">
+      {/* Legend */}
+      <div className="flex items-center gap-4 mb-2">
+        <div className="flex items-center gap-1.5">
+          <div className="w-3 h-2.5 rounded-sm" style={{ background: plannedColor }} />
+          <span className="text-[10px] text-gray-500">Planned %</span>
+        </div>
+        <div className="flex items-center gap-1.5">
+          <div className="w-3 h-2.5 rounded-sm" style={{ background: actualColor }} />
+          <span className="text-[10px] text-gray-500">Actual %</span>
+        </div>
+      </div>
+
+      {/* Row per trade */}
+      {trades.map((trade, i) => {
+        const plannedPct = Math.min(trade.planned?.cumulative_percent_complete ?? 0, 100)
+        const actualPct  = Math.min(trade.actual?.cumulative_percent_complete  ?? 0, 100)
+        const label      = trade.trade_name ?? trade.trade_label ?? trade.trade_code
+        const finVar     = trade.variance?.finish_variance_days
+        const varColor   = finVar == null ? 'text-gray-400' : finVar > 0 ? 'text-red-500' : finVar < 0 ? 'text-green-600' : 'text-gray-500'
+
+        return (
+          <div key={i} data-trade-row className="grid items-center gap-x-2" style={{ gridTemplateColumns: '56px 1fr 40px' }}>
+            {/* Trade label */}
+            <span className="text-[10px] font-semibold text-gray-600 truncate text-right pr-1">{label}</span>
+
+            {/* Dual progress bars */}
+            <div className="space-y-0.5">
+              {/* Planned */}
+              <div className="w-full rounded-sm overflow-hidden" style={{ height: 6, background: bgTrack }}>
+                <div className="h-full rounded-sm transition-all" style={{ width: `${plannedPct}%`, background: plannedColor, opacity: 0.7 }} />
+              </div>
+              {/* Actual */}
+              <div className="w-full rounded-sm overflow-hidden" style={{ height: 6, background: bgTrack }}>
+                <div className="h-full rounded-sm transition-all" style={{ width: `${actualPct}%`, background: actualColor }} />
+              </div>
+            </div>
+
+            {/* Percentages */}
+            <div className="text-right">
+              <div className="text-[9px] text-gray-400">{fmtNum(plannedPct, 1)}%</div>
+              <div className="text-[9px] font-semibold text-gray-700">{fmtNum(actualPct, 1)}%</div>
+              {finVar != null && <div className={`text-[9px] ${varColor}`}>{finVar > 0 ? `+${finVar}d` : `${finVar}d`}</div>}
+            </div>
+          </div>
+        )
+      })}
+    </div>
+  )
+}
+
+// progress_bar — content.value (0–100), content.label
+function ProgressBarWidget({ ast }: { ast: Record<string, unknown> }) {
+  const content = getContent(ast)
+  const raw    = content.value    as number | null
+  const label  = content.label   as string | null
+  const target = content.target  as number | null
+  const pct = raw != null ? (raw > 1 ? raw : raw * 100) : null
+  return (
+    <div className="space-y-1">
+      <div className="flex justify-between text-xs">
+        <span className="text-gray-500">{label ?? 'Progress'}</span>
+        <span className="font-bold text-gray-900">{pct != null ? `${fmtNum(pct)}%` : '—'}</span>
+      </div>
+      <div className="w-full bg-gray-100 rounded-full h-3">
+        <div className="bg-blue-500 h-3 rounded-full transition-all" style={{ width: `${Math.min(pct ?? 0, 100)}%` }} />
+      </div>
+      {target != null && <p className="text-[10px] text-gray-400">Target: {fmtNum(target)}%</p>}
+    </div>
+  )
+}
+
+// ── Shared chart helpers ───────────────────────────────────────────────────────
+
+// Static fallback palette — used when no series color is specified and design hasn't loaded
+const PALETTE_FALLBACK = ['#3b82f6', '#10b981', '#f59e0b', '#ef4444', '#8b5cf6', '#06b6d4', '#ec4899']
+
+// Returns a design-aware chart palette from the DesignContext
+function useChartPalette(): string[] {
+  const tok = useContext(DesignContext)
+  return [
+    tok('primary',    PALETTE_FALLBACK[0]),
+    tok('mint',       PALETTE_FALLBACK[1]),
+    tok('warning',    PALETTE_FALLBACK[2]),
+    tok('critical',   PALETTE_FALLBACK[3]),
+    tok('primary_light', PALETTE_FALLBACK[4]),
+    tok('chart_neutral', PALETTE_FALLBACK[5]),
+    tok('chart_highlight', PALETTE_FALLBACK[6]),
+  ]
+}
+
+// Keep PALETTE as alias for backwards-compat in places that can't use hooks
+const PALETTE = PALETTE_FALLBACK
+
+// Detect low-cardinality string columns suitable for filtering
+// Returns { key, values[] } pairs, ignoring xKey and the label field
+function detectFilterFields(
+  data: Record<string, unknown>[],
+  excludeKeys: string[]
+): { key: string; values: string[] }[] {
+  if (!data.length) return []
+  return Object.keys(data[0])
+    .filter(k => {
+      if (excludeKeys.includes(k)) return false
+      const sample = data[0][k]
+      if (typeof sample !== 'string') return false
+      const uniq = new Set(data.map(d => String(d[k] ?? '')))
+      return uniq.size >= 2 && uniq.size <= 15
+    })
+    .map(k => ({ key: k, values: [...new Set(data.map(d => String(d[k] ?? '')))] }))
+}
+
+// Compact filter bar — renders one dropdown per filterable field
+function ChartFilters({
+  fields,
+  active,
+  setActive,
+}: {
+  fields: { key: string; values: string[] }[]
+  active: Record<string, string>
+  setActive: (v: Record<string, string>) => void
+}) {
+  if (!fields.length) return null
+  return (
+    <div className="no-print chart-filters flex flex-wrap items-center gap-1.5 mt-2">
+      {fields.map(f => (
+        <div key={f.key} className="flex flex-wrap items-center gap-1 min-w-0">
+          <span className="text-[9px] text-gray-400 capitalize">{f.key.replace(/_/g, ' ')}:</span>
+          <select
+            value={active[f.key] ?? ''}
+            onChange={e => setActive({ ...active, [f.key]: e.target.value })}
+            className="text-[10px] border border-gray-200 rounded px-1.5 py-0.5 bg-white text-gray-600 focus:outline-none focus:ring-1 focus:ring-blue-400"
+          >
+            <option value="">All</option>
+            {f.values.map(v => <option key={v} value={v}>{v}</option>)}
+          </select>
+        </div>
+      ))}
+      {Object.values(active).some(Boolean) && (
+        <button
+          onClick={() => setActive({})}
+          className="text-[9px] text-gray-400 hover:text-gray-600 px-1 py-0.5 rounded border border-gray-200"
+        >
+          Clear
+        </button>
+      )}
+    </div>
+  )
+}
+
+// Online KPI charts use explicit multi-select pills; other charts keep their filters.
+function KpiChartOptions({ options, selected, onChange }: {
+  options: { value: string; label: string }[]
+  selected: string[]
+  onChange: (values: string[]) => void
+}) {
+  const tok = useContext(DesignContext)
+  const values = selected.filter(value => options.some(option => option.value === value))
+  if (!options.length) return null
+  const pill = (active: boolean): React.CSSProperties => ({
+    fontSize: 11, fontWeight: 600, padding: '4px 10px', borderRadius: 99,
+    border: `1px solid ${active ? tok('primary', '#5741DF') : '#e2e8f0'}`,
+    background: active ? tok('sidebar_active_bg', '#eff6ff') : '#f8fafc',
+    color: active ? tok('primary', '#5741DF') : '#64748b',
+    cursor: 'pointer', transition: 'all 0.15s',
+  })
+  return <div className="no-print chart-filters flex flex-wrap items-center gap-1.5 mt-2" role="group" aria-label="Select KPIs to display">
+    <span className="text-[11px] text-gray-500 mr-1">KPIs:</span>
+    <button type="button" aria-pressed={values.length === 0} style={pill(values.length === 0)} onClick={() => onChange([])}>All</button>
+    {options.map(option => {
+      const active = values.includes(option.value)
+      return <button key={option.value} type="button" aria-pressed={active} style={pill(active)}
+        onClick={() => onChange(active ? values.filter(value => value !== option.value) : [...values, option.value])}>
+        {option.label}
+      </button>
+    })}
+  </div>
+}
+
+function applyFilters(data: Record<string, unknown>[], active: Record<string, string>) {
+  return Object.entries(active).reduce((acc, [k, v]) => {
+    if (!v) return acc
+    return acc.filter(row => String(row[k] ?? '') === v)
+  }, data)
+}
+
+type SeriesSpec = { key: string; label: string; color?: string; dashed?: boolean }
+
+// Normalise series from content:
+//   content.series[]: { value_field, name, color?, line_style?, semantic_series? }
+// Falls back to all numeric keys except xKey.
+function useNormalisedSeries(content: Record<string, unknown>, xKey: string): SeriesSpec[] {
+  const tok = useContext(DesignContext)
+  const semanticColors = designObject(tok.spec.semantic_colors)
+  const themePalette = useChartPalette()
+  type RawSeries = { value_field?: string; name?: string; color?: string; line_style?: string; semantic_series?: string }
+  const raw = content.series as RawSeries[] | null
+  if (raw?.length) {
+    return raw
+      .filter(s => s.value_field)
+      .map((s, i) => ({
+        key:    s.value_field!,
+        label:  s.name ?? s.value_field!,
+        color: (() => {
+          const semantic = s.semantic_series ?? (/planned/i.test(s.name ?? s.value_field ?? '') ? 'planned' : /actual/i.test(s.name ?? s.value_field ?? '') ? 'actual' : '')
+          const rule = designObject(semanticColors[semantic])
+          if (typeof rule.color_token === 'string') return tok(rule.color_token, s.color ?? PALETTE[i % PALETTE.length])
+          if (typeof rule.hex === 'string') return rule.hex
+          if (Object.keys(designObject(tok.spec.chart_styles)).length) return themePalette[i % themePalette.length]
+          return s.color ?? (semantic === 'planned' ? tok('primary', '#3b82f6') : semantic === 'actual' ? tok('mint', '#10b981') : PALETTE[i % PALETTE.length])
+        })(),
+        dashed: s.line_style === 'dashed',
+      }))
+  }
+  // Auto-infer from first data row
+  const data = content.data as Record<string, unknown>[] | null
+  if (!data?.length) return []
+  return Object.keys(data[0])
+    .filter(k => k !== xKey && typeof data[0][k] === 'number')
+    .map((k, i) => ({ key: k, label: k.replace(/_/g, ' '), color: themePalette[i % themePalette.length] }))
+}
+
+// ── A3 print scaling — module-level shared state ──────────────────────────────
+
+// All usePrintMode instances register here so preparePrint() can flushSync them all
+const _printSetters = new Set<Dispatch<SetStateAction<boolean>>>()
+
+// Epoch counter — incremented after every print cleanup so ResponsiveContainers
+// remount (via key) and re-measure at their true screen width.
+let _printEpoch = 0
+const _epochSetters = new Set<Dispatch<SetStateAction<number>>>()
+
+const DASHBOARD_MARGIN_MM = 0
+let printPrepared = false
+
+function configureDashboardPaper(): void {
+  let style = document.getElementById('__a3-print-override') as HTMLStyleElement | null
+  if (!style) {
+    style = document.createElement('style')
+    style.id = '__a3-print-override'
+    document.head.appendChild(style)
+  }
+  // Override the named page actually used by .a3-print-root, including Ctrl+P.
+  style.textContent = `@page { size: A3 landscape; margin: ${DASHBOARD_MARGIN_MM}mm; } @page a3dash { size: A3 landscape; margin: ${DASHBOARD_MARGIN_MM}mm; }`
+}
+
+function preparePrint(el: HTMLElement): void {
+  configureDashboardPaper()
+  const root = document.documentElement
+  root.classList.add('a3-printing')
+  if (!printPrepared) {
+    printPrepared = true
+    flushSync(() => { _printSetters.forEach(s => s(true)) })
+  }
+  const [widthMM, heightMM] = [420, 297]
+  const width = (widthMM - 2 * DASHBOARD_MARGIN_MM) * 96 / 25.4
+  const height = (heightMM - 2 * DASHBOARD_MARGIN_MM) * 96 / 25.4
+  root.style.setProperty('--dashboard-paper-width', `${width}px`)
+  el.style.zoom = '1'
+  el.style.width = `${width}px`
+  // Fixed A3 canvas: never widen the sheet to fit a tall screen widget.
+  const scale = Math.min(width / el.scrollWidth, height / el.scrollHeight, 1)
+  el.style.zoom = String(scale)
+}
+
+// Final fit uses the rendered SVG layout after ResizeObserver has settled.
+function fitRenderedPrint(el: HTMLElement): void {
+  const [w, h] = [420, 297]
+  const bounds = el.getBoundingClientRect()
+  const factor = Math.min(
+    (w - 2 * DASHBOARD_MARGIN_MM) * 96 / 25.4 / bounds.width,
+    (h - 2 * DASHBOARD_MARGIN_MM) * 96 / 25.4 / bounds.height,
+    1,
+  ) * 0.995
+  el.style.zoom = String(Number(el.style.zoom || 1) * factor)
+}
+
+function cleanupPrint(synchronous = true): void {
+  printPrepared = false
+  document.documentElement.classList.remove('a3-printing')
+  document.documentElement.style.removeProperty('--dashboard-paper-width')
+  const el = document.querySelector('.a3-page') as HTMLElement | null
+  if (el) { el.style.zoom = ''; el.style.width = '' }
+  const reset = () => { _printSetters.forEach(s => s(false)) }
+  if (synchronous) flushSync(reset)
+  else reset()
+  requestAnimationFrame(() => requestAnimationFrame(() => {
+    _printEpoch++
+    _epochSetters.forEach(s => s(_printEpoch))
+  }))
+}
+
+function useA3PrintScale(enabled: boolean): void {
+  useEffect(() => {
+    if (!enabled) return
+    configureDashboardPaper()
+    const onBefore = () => {
+      const el = document.querySelector('.a3-page') as HTMLElement | null
+      if (el) {
+        if (!printPrepared) preparePrint(el)
+        fitRenderedPrint(el)
+      }
+    }
+    const onAfter = () => cleanupPrint()
+    window.addEventListener('beforeprint', onBefore)
+    window.addEventListener('afterprint', onAfter)
+    return () => {
+      window.removeEventListener('beforeprint', onBefore)
+      window.removeEventListener('afterprint', onAfter)
+      cleanupPrint(false)
+      document.getElementById('__a3-print-override')?.remove()
+    }
+  }, [enabled])
+}
+
+async function printDashboard(): Promise<void> {
+  const el = document.querySelector('.a3-page') as HTMLElement | null
+  if (!el) return
+  try {
+    await document.fonts.ready
+    preparePrint(el)
+    // ResizeObserver and React must settle at the print canvas width before
+    // the browser snapshots Recharts' explicitly sized SVGs.
+    await new Promise(resolve => setTimeout(resolve, 350))
+    preparePrint(el)
+    await new Promise(resolve => setTimeout(resolve, 350))
+    fitRenderedPrint(el)
+    window.print()
+  } finally {
+    cleanupPrint()
+  }
+}
+
+// ── Print mode hook — fires before print dialog opens ─────────────────────────
+// Returns true while the browser is in print layout. Used to disable animations
+// and chart-specific print adjustments.
+function usePrintMode(): boolean {
+  const [printing, setPrinting] = useState(false)
+  useEffect(() => {
+    _printSetters.add(setPrinting)
+    // Keep own beforeprint/afterprint listeners so non-A3 print paths also set isPrinting
+    const onBefore = () => setPrinting(true)
+    const onAfter  = () => setPrinting(false)
+    window.addEventListener('beforeprint', onBefore)
+    window.addEventListener('afterprint',  onAfter)
+    return () => {
+      _printSetters.delete(setPrinting)
+      window.removeEventListener('beforeprint', onBefore)
+      window.removeEventListener('afterprint',  onAfter)
+    }
+  }, [])
+  return printing
+}
+
+// Returns the current epoch value — changes after every print cleanup, triggering
+// ResponsiveContainer remounts via key={epoch}.
+function usePrintEpoch(): number {
+  const [epoch, setEpoch] = useState(_printEpoch)
+  useEffect(() => {
+    _epochSetters.add(setEpoch)
+    return () => { _epochSetters.delete(setEpoch) }
+  }, [])
+  return epoch
+}
+
+// ── Chart label density helpers ───────────────────────────────────────────────
+
+// X-axis tick thinning: show at most ~maxTicks labels. Recharts' `interval` is the number of
+// ticks to SKIP between shown ones, so 0 = every tick, 4 = every 5th.
+function xTickInterval(count: number, maxTicks = 7): number {
+  return count <= maxTicks ? 0 : Math.ceil(count / maxTicks) - 1
+}
+
+// Data-point label collision avoidance for multi-series line charts.
+//  • thins each series to ~maxLabels labels when data is dense
+//  • staggers each series' starting index so series don't label the same x-position
+//  • alternates label side per series (even → above the point, odd → below)
+function lineLabelPlan(count: number, seriesCount: number, maxLabels = 8) {
+  const step = Math.max(1, Math.ceil(count / maxLabels))
+  return (seriesIdx: number, index: number): { show: boolean; below: boolean } => {
+    const phase = Math.floor((step * seriesIdx) / Math.max(1, seriesCount))
+    return { show: (index - phase) % step === 0 && index >= phase, below: seriesIdx % 2 === 1 }
+  }
+}
+
+// line_chart — content.data[], content.series[].value_field, content.category_field
+// Routes to SCurveLineChartWidget when semantic_role === 's_curve'
+function LineChartWidget({ ast }: { ast: Record<string, unknown> }) {
+  const semanticRole = ast.semantic_role as string | null
+  const title = ast.title as string | null
+  const isSCurve = semanticRole === 's_curve' || (title ?? '').toLowerCase().includes('s-curve')
+  if (isSCurve) return <SCurveLineChartWidget ast={ast} />
+
+  const content = getContent(ast)
+  const data  = content.data as Record<string, unknown>[] | null
+  const xKey  = (content.category_field ?? content.x_key ?? content.x_axis ?? 'period_end') as string
+  const labelKey = (content.category_label_field ?? xKey) as string
+  const series = useNormalisedSeries(content, xKey)
+  const [activeFilters, setActiveFilters] = useState<Record<string, string>>({})
+  const dataDate = useContext(DataDateContext)
+  const isPrinting = usePrintMode()
+  const isCompact  = useContext(CompactContext)
+  const palette  = useChartPalette()
+
+  const printEpoch = usePrintEpoch()
+  const filterFields = useMemo(() => (data?.length ? detectFilterFields(data, [xKey, labelKey]) : []), [data, xKey, labelKey])
+  const filtered = useMemo(() => (data?.length ? applyFilters(data, activeFilters) : []), [data, activeFilters])
+
+  if (!data?.length) return <NoData />
+
+  const sliced = filtered
+  console.log('[LineChartWidget] series:', series, '| first row:', sliced[0], '| xKey:', xKey)
+  const chartData = sliced.map(d => ({ ...d, __x: d[labelKey] ?? d[xKey] }))
+  const ddLabel = findDataDateLabel(sliced, xKey, labelKey, dataDate)
+
+  // XAxis height: fit rotated labels (angle -30°, sin30=0.5, cos30=0.866, font=10px)
+  const _lcFontPx = 10
+  const _lcAngle = Math.PI / 6
+  const _lcMaxChars = Math.max(...chartData.map(d => String(d.__x ?? '').length), 4)
+  const xAxisHeight = Math.max(
+    isCompact ? 36 : 52,
+    Math.ceil(_lcMaxChars * _lcFontPx * 0.55 * Math.sin(_lcAngle) + _lcFontPx * Math.cos(_lcAngle) + 8)
+  )
+
+  // Margins: bottom = 4 (outer gutter only — XAxis height already holds rotated labels).
+  // In print legend is on top (+24px budget); on screen it's below the chart (Recharts
+  // adds its own space outside chartH so we don't need to reserve it here).
+  const MIN_PLOT = 110
+  const chartMargin = isCompact
+    ? (isPrinting
+        ? { top: 4, right: 20, left: 36, bottom: 4 }
+        : { top: 16, right: 16, left: 8, bottom: 4 })
+    : { top: 28, right: 24, left: 28, bottom: 4 }
+  // chartH = top + legendH(print) + xAxisHeight + MIN_PLOT + bottom
+  const _lcLegendH = isPrinting ? 24 : 0
+  const chartH = isCompact
+    ? Math.max(chartMargin.top + _lcLegendH + xAxisHeight + MIN_PLOT + chartMargin.bottom, isPrinting ? 0 : 200)
+    : chartMargin.top + _lcLegendH + xAxisHeight + MIN_PLOT + chartMargin.bottom
+  const yAxisWidth  = isCompact ? 36 : 48
+  const legendStyle = isCompact ? { fontSize: 10, paddingTop: 4 } : { fontSize: 12, paddingTop: 8 }
+
+  // Thin labels for dense charts: only render every Nth label so text never overlaps.
+  // At <=12 points every label shows; beyond that we skip proportionally.
+  const labelPlan = lineLabelPlan(chartData.length, series.length)
+
+  return (
+    <div style={{ minWidth: 0, overflow: 'visible' }}>
+      <div className="print-chart" style={{ overflow: 'visible' }}>
+        <ResponsiveContainer key={printEpoch} width="100%" height={chartH}>
+          <LineChart data={chartData} margin={chartMargin}>
+            <CartesianGrid strokeDasharray="3 3" stroke="#e5e7eb" />
+            <XAxis dataKey="__x" tick={{ fontSize: 10 }} interval={xTickInterval(chartData.length)} angle={-30} textAnchor="end" height={xAxisHeight} />
+            <YAxis tick={{ fontSize: 11 }} width={yAxisWidth} />
+            <Tooltip contentStyle={{ fontSize: 12 }} />
+            <Legend verticalAlign={isPrinting ? 'top' : 'bottom'} wrapperStyle={legendStyle} />
+            {series.map((s, i) => {
+              const color = s.color ?? palette[i % palette.length]
+              return (
+                <Line
+                  key={s.key}
+                  type="monotone"
+                  dataKey={s.key}
+                  name={s.label}
+                  stroke={color}
+                  strokeDasharray={s.dashed ? '6 3' : undefined}
+                  dot={(isCompact && !isPrinting) ? false : { r: 3, fill: color, strokeWidth: 0 }}
+                  activeDot={isPrinting ? false : { r: 5, strokeWidth: 2 }}
+                  strokeWidth={2.5}
+                  connectNulls={false}
+                  isAnimationActive={!isPrinting}
+                >
+                  <LabelList
+                    dataKey={s.key}
+                    position="top"
+                    style={{ fontSize: 9, fontWeight: 600, fill: color }}
+                    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+                    content={(props: any) => {
+                      const { x, y, value, index } = props
+                      if (value == null || value === '') return null
+                      const { show, below } = labelPlan(i, index)
+                      // In print: only first, last, and every 8th point to avoid overlap
+                      const finalShow = isPrinting
+                        ? (index === 0 || index === chartData.length - 1 || index % 8 === 0)
+                        : show
+                      if (!finalShow) return null
+                      return (
+                        <text x={x} y={below ? y + 14 : y - 7} textAnchor="middle" fontSize={9} fontWeight={600} fill={color}
+                          stroke="#fff" strokeWidth={3} paintOrder="stroke">
+                          {fmtNum(value, 1)}
+                        </text>
+                      )
+                    }}
+                  />
+                </Line>
+              )
+            })}
+            {ddLabel && (
+              <ReferenceLine
+                x={ddLabel}
+                stroke="#ef4444"
+                strokeWidth={1.5}
+                strokeDasharray="4 3"
+                label={{ value: 'Data Date', position: 'insideTopRight', fontSize: 9, fill: '#ef4444',
+                         dy: isPrinting ? -14 : 6, dx: isPrinting ? 4 : -4 }}
+              />
+            )}
+          </LineChart>
+        </ResponsiveContainer>
+      </div>
+      <ChartFilters fields={filterFields} active={activeFilters} setActive={setActiveFilters} />
+    </div>
+  )
+}
+
+// ── S-Curve widget with Power BI-style range slicer ───────────────────────────
+function SCurveLineChartWidget({ ast }: { ast: Record<string, unknown> }) {
+  const content = getContent(ast)
+  const data = content.data as Record<string, unknown>[] | null
+  const palette = useChartPalette()
+  const printEpoch = usePrintEpoch()
+  if (!data?.length) return <NoData />
+
+  const xKey      = (content.category_field      ?? 'period_end')   as string
+  const labelKey  = (content.category_label_field ?? xKey)           as string
+  const series    = useNormalisedSeries(content, xKey)
+  const yUnit     = ((content.y_axis as Record<string, unknown> | null)?.unit ?? '') as string
+  const dataDate  = useContext(DataDateContext)
+  const isPrinting = usePrintMode()
+  const isCompact  = useContext(CompactContext)
+
+  const totalLen = data.length
+  const [rangeStart, setRangeStart] = useState(0)
+  const [rangeEnd,   setRangeEnd]   = useState(totalLen - 1)
+  const trackRef  = useRef<HTMLDivElement>(null)
+  const dragging  = useRef<'start' | 'end' | null>(null)
+
+  // Keep range valid if data length changes
+  useEffect(() => {
+    setRangeStart(0)
+    setRangeEnd(totalLen - 1)
+  }, [totalLen])
+
+  const slicedData = useMemo(
+    () => data.slice(rangeStart, rangeEnd + 1).map(d => ({ ...d, __x: d[labelKey] ?? d[xKey] })),
+    [data, rangeStart, rangeEnd, labelKey, xKey]
+  )
+
+  // Convert clientX → index clamped to [0, totalLen-1]
+  function clientXToIndex(clientX: number): number {
+    if (!trackRef.current) return 0
+    const rect = trackRef.current.getBoundingClientRect()
+    const ratio = Math.max(0, Math.min(1, (clientX - rect.left) / rect.width))
+    return Math.round(ratio * (totalLen - 1))
+  }
+
+  function onMouseDown(handle: 'start' | 'end') {
+    return (e: React.MouseEvent) => {
+      e.preventDefault()
+      dragging.current = handle
+      const onMove = (ev: MouseEvent) => {
+        const idx = clientXToIndex(ev.clientX)
+        if (dragging.current === 'start') setRangeStart(Math.min(idx, rangeEnd - 1))
+        else                              setRangeEnd(Math.max(idx, rangeStart + 1))
+      }
+      const onUp = () => {
+        dragging.current = null
+        window.removeEventListener('mousemove', onMove)
+        window.removeEventListener('mouseup',   onUp)
+      }
+      window.addEventListener('mousemove', onMove)
+      window.addEventListener('mouseup',   onUp)
+    }
+  }
+
+  function onTouchStart(handle: 'start' | 'end') {
+    return () => {
+      const onMove = (ev: TouchEvent) => {
+        const idx = clientXToIndex(ev.touches[0].clientX)
+        if (handle === 'start') setRangeStart(Math.min(idx, rangeEnd - 1))
+        else                    setRangeEnd(Math.max(idx, rangeStart + 1))
+      }
+      const onEnd = () => {
+        window.removeEventListener('touchmove', onMove)
+        window.removeEventListener('touchend',  onEnd)
+      }
+      window.addEventListener('touchmove', onMove)
+      window.addEventListener('touchend',  onEnd)
+    }
+  }
+
+  const startPct = (rangeStart / (totalLen - 1)) * 100
+  const endPct   = (rangeEnd   / (totalLen - 1)) * 100
+  const startLabel = String(data[rangeStart]?.[labelKey] ?? data[rangeStart]?.[xKey] ?? '')
+  const endLabel   = String(data[rangeEnd]  ?.[labelKey] ?? data[rangeEnd]  ?.[xKey] ?? '')
+
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const customTooltip = (props: any) => {
+    const { active, payload, label } = props
+    if (!active || !payload?.length) return null
+    return (
+      <div className="bg-white border border-gray-200 rounded-lg px-3 py-2 shadow text-xs">
+        <p className="font-semibold text-gray-600 mb-1">{label}</p>
+        {payload.map((p: { name: string; value: number; color: string }, i: number) => (
+          <div key={i} className="flex items-center gap-1.5">
+            <span className="w-2 h-2 rounded-full inline-block flex-shrink-0" style={{ background: p.color }} />
+            <span className="text-gray-500">{p.name}:</span>
+            <span className="font-bold text-gray-800">{p.value != null ? `${Number(p.value).toFixed(2)}${yUnit}` : '—'}</span>
+          </div>
+        ))}
+      </div>
+    )
+  }
+
+  const ddLabelSC = findDataDateLabel(slicedData, xKey, labelKey, dataDate)
+
+  // XAxis height: fit rotated labels (angle -30°, font=10px)
+  const _scFontPx = 10
+  const _scAngle = Math.PI / 6
+  const _scMaxChars = Math.max(...slicedData.map(d => String(d.__x ?? '').length), 4)
+  const scXAxisHeight = Math.max(
+    48,
+    Math.ceil(_scMaxChars * _scFontPx * 0.55 * Math.sin(_scAngle) + _scFontPx * Math.cos(_scAngle) + 8)
+  )
+
+  // Margins: bottom = 4 (outer gutter only).
+  // Print legend is on top, so reserve 24px for it in the height calculation.
+  const SC_MIN_PLOT = 110
+  const scMargin = isPrinting
+    ? { top: 4, right: 20, left: 36, bottom: 4 }
+    : { top: 28, right: 16, left: 28, bottom: 8 }
+  const _scLegendH = isPrinting ? 24 : 0
+  const sCurveH = isCompact
+    ? Math.max(scMargin.top + _scLegendH + scXAxisHeight + SC_MIN_PLOT + scMargin.bottom, isPrinting ? 0 : 150)
+    : Math.max(scMargin.top + _scLegendH + scXAxisHeight + SC_MIN_PLOT + scMargin.bottom, 300)
+
+  const scLabelPlan = lineLabelPlan(slicedData.length, series.length)
+
+  return (
+    <div className="flex flex-col gap-3">
+      {/* Chart */}
+      <div className="print-chart">
+        <ResponsiveContainer key={printEpoch} width="100%" height={sCurveH}>
+          <LineChart data={slicedData} margin={scMargin}>
+            <CartesianGrid strokeDasharray="3 3" stroke="#e5e7eb" />
+            <XAxis dataKey="__x" tick={{ fontSize: 10 }}
+              interval={isPrinting
+                ? (slicedData.length <= 12 ? 0 : 3)
+                : xTickInterval(slicedData.length)}
+              angle={-30} textAnchor="end"
+              height={scXAxisHeight} />
+            <YAxis tick={{ fontSize: 11 }} unit={yUnit} domain={[0, 'auto']} />
+            <Tooltip content={customTooltip} />
+            <Legend verticalAlign={isPrinting ? 'top' : 'bottom'} wrapperStyle={{ fontSize: isPrinting ? 10 : 12 }} />
+            {series.map((s, i) => {
+              const color = s.color ?? palette[i % palette.length]
+              return (
+                <Line
+                  key={s.key}
+                  type="monotone"
+                  dataKey={s.key}
+                  name={s.label}
+                  stroke={color}
+                  strokeDasharray={s.dashed ? '6 3' : undefined}
+                  dot={{ r: 3, fill: color, strokeWidth: 0 }}
+                  activeDot={isPrinting ? false : { r: 5, strokeWidth: 2 }}
+                  strokeWidth={2.5}
+                  connectNulls={false}
+                  isAnimationActive={false}
+                >
+                  <LabelList
+                    dataKey={s.key}
+                    position="top"
+                    style={{ fontSize: 9, fontWeight: 600, fill: color }}
+                    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+                    content={(props: any) => {
+                      const { x, y, value, index } = props
+                      if (value == null || value === '') return null
+                      const { show, below } = scLabelPlan(i, index)
+                      // In print: only first, last, and every 8th point to avoid overlap
+                      const finalShow = isPrinting
+                        ? (index === 0 || index === slicedData.length - 1 || index % 8 === 0)
+                        : show
+                      if (!finalShow) return null
+                      return (
+                        <text x={x} y={below ? y + 14 : y - 7} textAnchor="middle" fontSize={9} fontWeight={600} fill={color}
+                          stroke="#fff" strokeWidth={3} paintOrder="stroke">
+                          {fmtNum(value, 1)}
+                        </text>
+                      )
+                    }}
+                  />
+                </Line>
+              )
+            })}
+            {ddLabelSC && (
+              <ReferenceLine
+                x={ddLabelSC}
+                stroke="#ef4444"
+                strokeWidth={1.5}
+                strokeDasharray="4 3"
+                label={{ value: 'Data Date', position: 'insideTopRight', fontSize: 9, fill: '#ef4444',
+                         dy: isPrinting ? -14 : 6, dx: isPrinting ? 4 : -4 }}
+              />
+            )}
+          </LineChart>
+        </ResponsiveContainer>
+      </div>
+
+      {/* Slicer — hidden on print and in compact A3 mode */}
+      {!isCompact && <div className={`no-print px-1 pt-1 pb-2 bg-gray-50 rounded-lg border border-gray-200`}>
+        <div className="flex items-center justify-between mb-1.5 px-1">
+          <span className="text-[10px] font-semibold text-gray-400 uppercase tracking-wider">Date Range</span>
+          <div className="flex items-center gap-1 text-[10px] text-gray-500">
+            <span className="font-medium text-gray-700">{startLabel}</span>
+            <span className="text-gray-300">→</span>
+            <span className="font-medium text-gray-700">{endLabel}</span>
+            <span className="ml-1 text-gray-400">({rangeEnd - rangeStart + 1} periods)</span>
+          </div>
+        </div>
+
+        {/* Track */}
+        <div
+          ref={trackRef}
+          className="relative mx-3 h-1.5 rounded-full bg-gray-200 cursor-pointer select-none"
+          style={{ userSelect: 'none' }}
+        >
+          {/* Selected range fill */}
+          <div
+            className="absolute h-full rounded-full bg-blue-400"
+            style={{ left: `${startPct}%`, width: `${endPct - startPct}%` }}
+          />
+
+          {/* Start handle */}
+          <div
+            className="absolute top-1/2 -translate-y-1/2 -translate-x-1/2 w-4 h-4 rounded-full bg-white border-2 border-blue-500 shadow-md cursor-grab active:cursor-grabbing z-10 flex items-center justify-center"
+            style={{ left: `${startPct}%` }}
+            onMouseDown={onMouseDown('start')}
+            onTouchStart={onTouchStart('start')}
+          >
+            <div className="w-1 h-2 rounded-full bg-blue-400" />
+          </div>
+
+          {/* End handle */}
+          <div
+            className="absolute top-1/2 -translate-y-1/2 -translate-x-1/2 w-4 h-4 rounded-full bg-white border-2 border-blue-500 shadow-md cursor-grab active:cursor-grabbing z-10 flex items-center justify-center"
+            style={{ left: `${endPct}%` }}
+            onMouseDown={onMouseDown('end')}
+            onTouchStart={onTouchStart('end')}
+          >
+            <div className="w-1 h-2 rounded-full bg-blue-400" />
+          </div>
+        </div>
+
+        {/* Tick labels — show first, middle, last */}
+        <div className="flex justify-between px-3 mt-1">
+          {[0, Math.floor((totalLen - 1) / 2), totalLen - 1].map(idx => (
+            <span key={idx} className="text-[9px] text-gray-400">
+              {String(data[idx]?.[labelKey] ?? data[idx]?.[xKey] ?? '')}
+            </span>
+          ))}
+        </div>
+      </div>}
+    </div>
+  )
+}
+
+// bar_chart / grouped_bar_chart / stacked_bar_chart
+// Some grouped_bar_chart records nest data under content.chart.data instead of content.data
+function BarChartWidget({ ast, horizontal, stacked, multiKpi = false }: { ast: Record<string, unknown>; horizontal?: boolean; stacked?: boolean; multiKpi?: boolean }) {
+  const content = getContent(ast)
+  const chartObj = (content.chart ?? {}) as Record<string, unknown>
+  const data  = (content.data ?? chartObj.data) as Record<string, unknown>[] | null
+  const merged = chartObj.data ? { ...content, ...chartObj } : content
+  const xKey  = (merged.category_field ?? merged.x_key ?? merged.x_axis ?? 'category') as string
+  const series = useNormalisedSeries(merged, xKey)
+  const [hidden, setHidden] = useState<Set<string>>(new Set())
+  const [activeFilters, setActiveFilters] = useState<Record<string, string>>({})
+  const [selectedKpis, setSelectedKpis] = useState<string[]>([])
+  const palette = useChartPalette()
+  const dataDate = useContext(DataDateContext)
+  const isPrintingBar = usePrintMode()
+  const isCompactBar  = useContext(CompactContext)
+  const printEpoch = usePrintEpoch()
+
+  // Hooks must run on every render — keep them above the early returns below
+  const filterFields = useMemo(() => (data?.length ? detectFilterFields(data, [xKey]) : []), [data, xKey])
+  const kpiKey = useMemo(() => ['kpi_code', 'kpi', 'kpi_id', xKey]
+    .find(key => data?.some(row => row[key] != null && String(row[key]) !== '')) ?? xKey, [data, xKey])
+  const kpiOptions = useMemo(() => {
+    const options = new Map<string, string>()
+    for (const row of data ?? []) {
+      if (row[kpiKey] == null || String(row[kpiKey]) === '') continue
+      const value = String(row[kpiKey])
+      const label = row.kpi_name ?? row.kpi_label ?? (xKey !== kpiKey ? row[xKey] : null) ?? value
+      if (!options.has(value)) options.set(value, String(label))
+    }
+    return [...options].map(([value, label]) => ({ value, label }))
+  }, [data, kpiKey, xKey])
+  const filtered = useMemo(() => {
+    if (!data?.length) return []
+    if (!multiKpi) return applyFilters(data, activeFilters)
+    const selected = selectedKpis.filter(value => kpiOptions.some(option => option.value === value))
+    return selected.length ? data.filter(row => selected.includes(String(row[kpiKey] ?? ''))) : data
+  }, [data, multiKpi, activeFilters, selectedKpis, kpiOptions, kpiKey])
+  const controls = multiKpi
+    ? <KpiChartOptions options={kpiOptions} selected={selectedKpis} onChange={setSelectedKpis} />
+    : <ChartFilters fields={filterFields} active={activeFilters} setActive={setActiveFilters} />
+
+  if (!data?.length) {
+    const emptyState = (content.empty_state ?? chartObj.empty_state) as { heading?: string; message?: string } | null
+    if (emptyState?.heading) {
+      return (
+        <div className="rounded-lg bg-gray-50 border border-gray-200 px-4 py-6 text-center">
+          <p className="text-xs font-semibold text-gray-500">{emptyState.heading}</p>
+          {emptyState.message && <p className="text-xs text-gray-400 mt-1 leading-relaxed">{emptyState.message}</p>}
+        </div>
+      )
+    }
+    return <NoData />
+  }
+
+  const isPrinting = isPrintingBar
+  const isCompact  = isCompactBar
+
+  const toggleSeries = (key: string) =>
+    setHidden(prev => { const n = new Set(prev); n.has(key) ? n.delete(key) : n.add(key); return n })
+
+  const visibleSeries = series.filter(s => !hidden.has(s.key))
+
+  if (horizontal) {
+    const sliced = filtered
+    const hHeight = isCompact
+      ? Math.max(100, sliced.length * 22)
+      : Math.max(220, sliced.length * 36)
+    return (
+      <div style={{ width: '100%', minWidth: 0 }}>
+        {multiKpi && controls}
+        {/* Fixed-height box reserves the chart's space in the layout, so the chart
+            (including its legend) can never spill outside the surrounding card */}
+        <div className="print-chart" style={{ width: '100%', height: hHeight + 40 }}>
+          <ResponsiveContainer key={printEpoch} width="100%" height="100%">
+            <BarChart data={sliced} layout="vertical" margin={{ top: 4, right: 24, left: 8, bottom: 4 }}>
+              <CartesianGrid strokeDasharray="3 3" stroke="#e5e7eb" horizontal={false} />
+              <XAxis type="number" tick={{ fontSize: 11 }} tickFormatter={fmtAxis} />
+              <YAxis type="category" dataKey={xKey} tick={{ fontSize: 11 }} width={96} />
+              <Tooltip contentStyle={{ fontSize: 12 }} />
+              <Legend verticalAlign="top" height={36} wrapperStyle={{ fontSize: 11, whiteSpace: 'normal' }} onClick={p => toggleSeries(p.dataKey as string)} />
+              {visibleSeries.map((s, i) => (
+                <Bar key={s.key} dataKey={s.key} name={s.label} fill={s.color ?? palette[i % palette.length]} radius={[0, 3, 3, 0]}
+                  isAnimationActive={!isPrinting} animationBegin={i * 100} animationDuration={800} animationEasing="ease-out" />
+              ))}
+            </BarChart>
+          </ResponsiveContainer>
+        </div>
+        {!multiKpi && controls}
+      </div>
+    )
+  }
+
+  const sliced = filtered
+  const ddLabelBar = findDataDateLabel(sliced, xKey, xKey, dataDate)
+
+  // XAxis height: fit rotated labels (angle -35°, sin35≈0.574, cos35≈0.819, font=10px)
+  const _barFontPx = 10
+  const _barAngle = 35 * (Math.PI / 180)
+  const _barMaxChars = Math.max(...sliced.map(d => String(d[xKey] ?? '').length), 4)
+  const barXAxisHeight = Math.max(
+    isCompact ? 60 : 80,
+    Math.ceil(_barMaxChars * _barFontPx * 0.55 * Math.sin(_barAngle) + _barFontPx * Math.cos(_barAngle) + 8)
+  )
+
+  // Total chart height = margin.top + legend(36) + plotH + barXAxisHeight + margin.bottom(0)
+  // plotH is proportional to bar count, clamped to a sensible range.
+  const BAR_MARGIN_TOP = 4
+  const BAR_LEGEND_H   = 36   // Recharts reserves this inside chartH for verticalAlign="top"
+  const BAR_MARGIN_BOT = 0
+  const barPlotH = isCompact
+    ? Math.min(180, Math.max(80, sliced.length * 28))
+    : Math.min(320, Math.max(160, sliced.length * 36))
+  const vHeight = BAR_MARGIN_TOP + BAR_LEGEND_H + barPlotH + barXAxisHeight + BAR_MARGIN_BOT
+  return (
+    <div style={{ width: '100%', minWidth: 0 }}>
+      {multiKpi && controls}
+      {/* Fixed-height box reserves the chart's space in the layout, so the chart
+          (including its legend) can never spill outside the surrounding card */}
+      <div className="print-chart" style={{ width: '100%', height: vHeight + 12 }}>
+        <ResponsiveContainer key={printEpoch} width="100%" height="100%">
+          <BarChart data={sliced} margin={{ top: BAR_MARGIN_TOP, right: 16, left: 28, bottom: BAR_MARGIN_BOT }}>
+            <CartesianGrid strokeDasharray="3 3" stroke="#e5e7eb" />
+            <XAxis dataKey={xKey} tick={{ fontSize: 10 }}
+              interval={isPrinting
+                ? (sliced.length <= 12 ? 0 : sliced.length <= 30 ? 2 : 3)
+                : (sliced.length <= 12 ? 0 : xTickInterval(sliced.length))}
+              angle={-35} textAnchor="end"
+              height={barXAxisHeight} />
+            <YAxis tick={{ fontSize: 11 }} width={52} tickFormatter={fmtAxis} />
+            <Tooltip contentStyle={{ fontSize: 12 }} />
+            <Legend verticalAlign="top" height={36} wrapperStyle={{ fontSize: 11, whiteSpace: 'normal' }} onClick={p => toggleSeries(p.dataKey as string)} />
+            {visibleSeries.map((s, i) => (
+              <Bar
+                key={s.key}
+                dataKey={s.key}
+                name={s.label}
+                fill={s.color ?? palette[i % palette.length]}
+                stackId={stacked ? 'stack' : undefined}
+                radius={stacked ? undefined : [3, 3, 0, 0]}
+                isAnimationActive={!isPrinting}
+                animationBegin={i * 100}
+                animationDuration={800}
+                animationEasing="ease-out"
+              />
+            ))}
+            {ddLabelBar && (
+              <ReferenceLine
+                x={ddLabelBar}
+                stroke="#ef4444"
+                strokeWidth={1.5}
+                strokeDasharray="4 3"
+                label={{ value: 'Data Date', position: 'insideTopRight', fontSize: 9, fill: '#ef4444', dy: 6, dx: -4 }}
+              />
+            )}
+          </BarChart>
+        </ResponsiveContainer>
+      </div>
+      {!multiKpi && controls}
+    </div>
+  )
+}
+
+// area_chart
+function AreaChartWidget({ ast }: { ast: Record<string, unknown> }) {
+  const content = getContent(ast)
+  const data  = content.data as Record<string, unknown>[] | null
+  const xKey  = (content.category_field ?? content.x_key ?? content.x_axis ?? 'period_end') as string
+  const series = useNormalisedSeries(content, xKey)
+  const [activeFilters, setActiveFilters] = useState<Record<string, string>>({})
+  const dataDate = useContext(DataDateContext)
+  const palette  = useChartPalette()
+  const isPrinting = usePrintMode()
+  const isCompact  = useContext(CompactContext)
+  const printEpoch = usePrintEpoch()
+
+  if (!data?.length) return <NoData />
+
+  const filterFields = useMemo(() => detectFilterFields(data, [xKey]), [data, xKey])
+  const filtered = useMemo(() => applyFilters(data, activeFilters), [data, activeFilters])
+  const sliced = filtered
+  const ddLabelArea = findDataDateLabel(sliced, xKey, xKey, dataDate)
+
+  // XAxis height: fit rotated labels (angle -30°, font=10px)
+  const _areaFontPx = 10
+  const _areaAngle = Math.PI / 6
+  const _areaMaxChars = Math.max(...sliced.map(d => String(d[xKey] ?? '').length), 4)
+  const areaXAxisHeight = Math.max(
+    48,
+    Math.ceil(_areaMaxChars * _areaFontPx * 0.55 * Math.sin(_areaAngle) + _areaFontPx * Math.cos(_areaAngle) + 8)
+  )
+  // areaH = top(8) + xAxisHeight + MIN_PLOT(110) + bottom(4)
+  // Legend is verticalAlign default (bottom) → Recharts places it outside chartH.
+  const AREA_MIN_PLOT = 110
+  const areaH = Math.max(
+    8 + areaXAxisHeight + AREA_MIN_PLOT + 4,
+    isCompact ? 140 : 280
+  )
+
+  return (
+    <div style={{ minWidth: 0, overflow: 'visible' }}>
+      <div className="print-chart" style={{ overflow: 'visible' }}>
+        <ResponsiveContainer key={printEpoch} width="100%" height={areaH}>
+          <AreaChart data={sliced} margin={{ top: 8, right: 24, left: 8, bottom: 4 }}>
+            <CartesianGrid strokeDasharray="3 3" stroke="#e5e7eb" />
+            <XAxis dataKey={xKey} tick={{ fontSize: 10 }} interval={xTickInterval(sliced.length)} angle={-30} textAnchor="end" height={areaXAxisHeight} />
+            <YAxis tick={{ fontSize: 11 }} width={48} />
+            <Tooltip contentStyle={{ fontSize: 12 }} />
+            <Legend wrapperStyle={{ fontSize: 12 }} />
+            {series.map((s, i) => (
+              <Area
+                key={s.key}
+                type="monotone"
+                dataKey={s.key}
+                name={s.label}
+                stroke={s.color ?? palette[i % palette.length]}
+                fill={s.color ?? palette[i % palette.length]}
+                fillOpacity={0.15}
+                strokeWidth={2}
+                connectNulls={false}
+                isAnimationActive={!isPrinting}
+              />
+            ))}
+            {ddLabelArea && (
+              <ReferenceLine
+                x={ddLabelArea}
+                stroke="#ef4444"
+                strokeWidth={1.5}
+                strokeDasharray="4 3"
+                label={{ value: 'Data Date', position: 'insideTopRight', fontSize: 9, fill: '#ef4444', dy: 6, dx: -4 }}
+              />
+            )}
+          </AreaChart>
+        </ResponsiveContainer>
+      </div>
+      <ChartFilters fields={filterFields} active={activeFilters} setActive={setActiveFilters} />
+    </div>
+  )
+}
+
+// donut_chart — data items vary by widget but share common patterns:
+//   name:  status_label | label | name | status_code
+//   value: count | value
+//   pct:   share_percent | display_percent | percentage | percent_of_categorized | share_of_categorised_statuses_percent
+//   color: color (optional, falls back to STATUS_COLORS then PALETTE)
+//   zero:  zero_value | is_zero_count | (value === 0)
+// center: center_metric | center_label — { label, value, unit, secondary_label?, secondary_value?, secondary_unit? }
+
+// Fixed colour map for engineering/QA status codes (A=green, B=blue, C=amber, D=red, UR=slate, OPN=red, CLS=green)
+const STATUS_COLORS: Record<string, string> = {
+  A: '#10b981', B: '#3b82f6', C: '#f59e0b', D: '#ef4444', UR: '#94a3b8',
+  OPN: '#ef4444', CLS: '#10b981',
+}
+
+function useStatusColor() {
+  const tok = useContext(DesignContext)
+  const token: Record<string, string> = { A: 'success', B: 'primary', C: 'warning', D: 'critical', UR: 'muted_text', OPN: 'critical', CLS: 'success' }
+  return (code: string, explicit?: string) => Object.keys(designObject(tok.spec.color_tokens)).length
+    ? tok(token[code] ?? '', explicit ?? STATUS_COLORS[code] ?? PALETTE[0])
+    : explicit ?? STATUS_COLORS[code] ?? PALETTE[0]
+}
+
+function DonutChartWidget({ ast }: { ast: Record<string, unknown> }) {
+  const statusColor = useStatusColor()
+  const content = getContent(ast)
+  type Slice = Record<string, unknown>
+  const chartObj = (content.chart ?? {}) as Record<string, unknown>
+  const raw = (content.data ?? chartObj.data ?? content.segments ?? content.slices) as Slice[] | null
+
+  // Resolve center metric — supports both center_metric and center_label shapes
+  type CenterMeta = { label?: string; value?: number; unit?: string; secondary_label?: string; secondary_value?: number; secondary_unit?: string }
+  const centerMeta = (content.center_metric ?? content.center_label) as CenterMeta | null
+
+  if (!raw?.length) return <NoData />
+
+  type NormSlice = { name: string; code: string; value: number; pct: number; color: string }
+  const normalised: NormSlice[] = raw
+    .map(d => {
+      const code  = String(d.status_code ?? d.code ?? '')
+      const name  = String(d.status_label ?? d.label ?? d.name ?? code ?? '?')
+      const value = (d.count ?? d.value ?? 0) as number
+      // Accept any of the percentage field names used across widgets
+      const pct   = (
+        d.share_percent ??
+        d.share_of_categorised_statuses_percent ??
+        d.display_percent ??
+        d.percentage ??
+        d.percent_of_categorized ??
+        0
+      ) as number
+      const color = statusColor(code, d.color as string | undefined)
+      return { name, code, value, pct, color }
+    })
+    .filter(d => d.value > 0)
+
+  if (!normalised.length) {
+    return (
+      <div className="flex flex-col items-center justify-center py-4 text-center gap-1">
+        <p className="text-xs font-semibold text-gray-400">All categories are zero</p>
+        {centerMeta && (
+          <p className="text-[10px] text-gray-300">{centerMeta.label}: {centerMeta.value ?? 0} {centerMeta.unit ?? ''}</p>
+        )}
+      </div>
+    )
+  }
+
+  const total = normalised.reduce((s, d) => s + d.value, 0)
+
+  const isPrinting = usePrintMode()
+  const isCompact  = useContext(CompactContext)
+  const donutSize  = isCompact ? 120 : 180
+  const innerR     = isCompact ? 34  : 52
+  const outerR     = isCompact ? 52  : 78
+
+  return (
+    <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+      {/* Donut + center metric */}
+      <div className="print-chart" style={{ position: 'relative', flexShrink: 0, width: donutSize }}>
+        <ResponsiveContainer width={donutSize} height={donutSize}>
+          <PieChart>
+            <Pie
+              data={normalised}
+              dataKey="value"
+              nameKey="name"
+              cx="50%"
+              cy="50%"
+              innerRadius={innerR}
+              outerRadius={outerR}
+              paddingAngle={2}
+              strokeWidth={0}
+              isAnimationActive={!isPrinting}
+              animationBegin={0}
+              animationDuration={900}
+              animationEasing="ease-out"
+            >
+              {normalised.map((entry, idx) => (
+                <Cell key={idx} fill={entry.color} />
+              ))}
+            </Pie>
+            <Tooltip
+              formatter={(val, name) => {
+                const n = typeof val === 'number' ? val : Number(val ?? 0)
+                return [`${n} (${((n / total) * 100).toFixed(2)}%)`, name]
+              }}
+              contentStyle={{ fontSize: 11, borderRadius: 6, zIndex: 9999, position: 'relative' }}
+              wrapperStyle={{ zIndex: 9999 }}
+            />
+          </PieChart>
+        </ResponsiveContainer>
+        {/* Center label overlay — always shown; uses centerMeta if available, otherwise shows total */}
+        <div style={{
+          position: 'absolute', top: '50%', left: '50%',
+          transform: 'translate(-50%, -50%)',
+          textAlign: 'center', pointerEvents: 'none', width: isCompact ? 60 : 90, zIndex: 1,
+          display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center',
+        }}>
+          <p style={{ fontSize: isCompact ? 14 : 20, fontWeight: 800, color: '#1e293b', margin: 0, lineHeight: 1 }}>
+            {centerMeta?.value ?? total}
+          </p>
+          <p style={{ fontSize: isCompact ? 8 : 9, color: '#94a3b8', margin: '2px 0 0', lineHeight: 1.3, textTransform: 'uppercase', letterSpacing: '0.04em' }}>
+            {centerMeta?.unit ?? 'total'}
+          </p>
+        </div>
+      </div>
+      {/* Right-side legend */}
+      <div style={{ flex: 1, display: 'flex', flexDirection: 'column', gap: isCompact ? 3 : 5 }}>
+        {normalised.map((entry, idx) => (
+          <div key={idx} style={{ display: 'flex', alignItems: 'center', gap: 7 }}>
+            <div style={{ width: isCompact ? 7 : 10, height: isCompact ? 7 : 10, borderRadius: 2, background: entry.color, flexShrink: 0 }} />
+            <span style={{ fontSize: isCompact ? 9 : 12, color: '#64748b', flex: 1, lineHeight: 1.3 }}>{entry.name}</span>
+            <span style={{ fontSize: isCompact ? 9 : 12, fontWeight: 700, color: '#1e293b' }}>{entry.value}</span>
+            <span style={{ fontSize: isCompact ? 9 : 11, color: '#94a3b8', minWidth: 30, textAlign: 'right' }}>
+              {entry.pct > 0 ? `${entry.pct.toFixed(0)}%` : `${((entry.value / total) * 100).toFixed(0)}%`}
+            </span>
+          </div>
+        ))}
+        {centerMeta?.label && (
+          <p style={{ fontSize: isCompact ? 8 : 10, color: '#94a3b8', marginTop: 4, lineHeight: 1.4 }}>{centerMeta.label}</p>
+        )}
+      </div>
+    </div>
+  )
+}
+
+// data_table — content.columns[] + content.rows[], or content.rows[] (auto columns)
+function DataTableWidget({ ast }: { ast: Record<string, unknown> }) {
+  const content = getContent(ast)
+  const rawCols = content.columns as unknown[] | null
+  const rows = (content.rows ?? content.data) as Record<string, unknown>[] | null
+  if (!rows?.length) return <NoData />
+  const columns = rawCols?.length ? rawCols : Object.keys(rows[0])
+  return <SortableTable columns={columns} rows={rows} />
+}
+
+// exception_table — red accent header, no-exceptions state
+function ExceptionTableWidget({ ast }: { ast: Record<string, unknown> }) {
+  const content = getContent(ast)
+  const rows = (content.rows ?? content.data ?? content.exceptions ?? content.items) as Record<string, unknown>[] | null
+  const rawCols = content.columns as unknown[] | null
+  if (!rows?.length) return (
+    <div className="flex items-center gap-2 text-xs text-green-600 py-2">
+      <svg className="w-4 h-4" fill="currentColor" viewBox="0 0 20 20">
+        <path fillRule="evenodd" d="M10 18a8 8 0 100-16 8 8 0 000 16zm3.707-9.293a1 1 0 00-1.414-1.414L9 10.586 7.707 9.293a1 1 0 00-1.414 1.414l2 2a1 1 0 001.414 0l4-4z" clipRule="evenodd" />
+      </svg>
+      No exceptions
+    </div>
+  )
+  const columns = rawCols?.length ? rawCols : Object.keys(rows[0])
+  return <SortableTable columns={columns} rows={rows} accentHeader />
+}
+
+// milestone_table / lookahead_table
+function MilestoneTableWidget({ ast }: { ast: Record<string, unknown> }) {
+  const content = getContent(ast)
+  const rows = (content.rows ?? content.milestones ?? content.activities ?? content.items ?? content.data) as Record<string, unknown>[] | null
+  if (!rows?.length) return <NoData />
+  return <AutoTable rows={rows} />
+}
+
+// hierarchical_table — flatten to a regular table
+function HierarchicalTableWidget({ ast }: { ast: Record<string, unknown> }) {
+  const content = getContent(ast)
+  const rows = (content.rows ?? content.data ?? content.items) as Record<string, unknown>[] | null
+  if (!rows?.length) return <NoData />
+  return <AutoTable rows={rows} />
+}
+
+// resource_table
+function ResourceTableWidget({ ast }: { ast: Record<string, unknown> }) {
+  const content = getContent(ast)
+  const rows = (content.rows ?? content.resources ?? content.items ?? content.data) as Record<string, unknown>[] | null
+  if (!rows?.length) return <NoData />
+  return <AutoTable rows={rows} />
+}
+
+// text_block — content can be a string directly, or content.text / content.body
+function TextBlockWidget({ ast }: { ast: Record<string, unknown> }) {
+  const raw = ast.content
+  // If content is a plain string, render it directly
+  if (typeof raw === 'string') {
+    return <p className="text-sm text-gray-700 leading-relaxed whitespace-pre-wrap">{raw}</p>
+  }
+  const content = getContent(ast)
+  const text = (content.text ?? content.body ?? content.narrative ?? content.summary) as string | null
+  return <p className="text-sm text-gray-700 leading-relaxed whitespace-pre-wrap">{text ?? '—'}</p>
+}
+
+// JSON fallback for unknown widget types
+// ── Smart fallback renderer ────────────────────────────────────────────────────
+// Inspects the widget_ast shape and delegates to the best-matching existing
+// component so that new widget types added by n8n render without a code change.
+// Falls back to a clean "unavailable" placeholder only when no match is found.
+
+function inferWidgetType(ast: Record<string, unknown>): string | null {
+  const content = (ast.content ?? ast) as Record<string, unknown>
+  // Chart signals
+  if (Array.isArray(content.series) && Array.isArray(content.data)) {
+    const typeHint = String(ast.chart_type ?? ast.type ?? '').toLowerCase()
+    if (typeHint.includes('area'))                    return 'area_chart'
+    if (typeHint.includes('bar'))                     return 'bar_chart'
+    if (typeHint.includes('stacked'))                 return 'stacked_bar_chart'
+    if (typeHint.includes('horizontal'))              return 'horizontal_bar_chart'
+    return 'line_chart'
+  }
+  if (Array.isArray(content.slices) || Array.isArray(content.segments))
+                                                      return 'donut_chart'
+  // Table signals
+  if (Array.isArray(content.rows) || Array.isArray(content.columns))
+                                                      return 'data_table'
+  if (Array.isArray(content.milestones))              return 'milestone_table'
+  if (Array.isArray(content.exceptions))              return 'exception_table'
+  // KPI / metric signals
+  if (content.value !== undefined || Array.isArray(content.metrics) ||
+      Array.isArray(content.primary_metrics))         return 'kpi_card'
+  if (Array.isArray(content.items) &&
+      (content.items as Record<string,unknown>[])[0]?.status !== undefined)
+                                                      return 'status_summary'
+  if (Array.isArray(content.items) &&
+      (content.items as Record<string,unknown>[])[0]?.narrative !== undefined)
+                                                      return 'narrative_summary'
+  if (Array.isArray(content.alerts))                  return 'alert_panel'
+  if (typeof content.text === 'string' ||
+      typeof content.body === 'string')               return 'text_block'
+  if (typeof content.percent !== 'undefined' ||
+      typeof content.progress !== 'undefined')        return 'progress_bar'
+  return null
+}
+
+// photo_gallery — content.photos[]: { photo_url, caption_or_description, photo_date_display, location_or_area }
+function PhotoGalleryWidget({ ast }: { ast: Record<string, unknown> }) {
+  const content = getContent(ast)
+  type Photo = { photo_url?: string; caption_or_description?: string; photo_date_display?: string; location_or_area?: string }
+  const photos = (content.photos ?? content.images ?? content.items) as Photo[] | null
+  if (!photos?.length) return <NoData msg="No photos available" />
+  return (
+    <div className="grid gap-3" style={{ gridTemplateColumns: 'repeat(auto-fill, minmax(160px, 1fr))' }}>
+      {photos.map((p, i) => (
+        <div key={i} className="flex flex-col rounded-lg overflow-hidden border border-gray-200 bg-gray-50">
+          {p.photo_url ? (
+            <img
+              src={p.photo_url}
+              alt={p.caption_or_description ?? `Photo ${i + 1}`}
+              className="w-full object-cover"
+              style={{ height: 110 }}
+              onError={e => { (e.currentTarget as HTMLImageElement).style.display = 'none' }}
+            />
+          ) : (
+            <div className="flex items-center justify-center bg-gray-100" style={{ height: 110 }}>
+              <svg width="28" height="28" viewBox="0 0 24 24" fill="none" stroke="#cbd5e1" strokeWidth="1.5">
+                <rect x="3" y="3" width="18" height="18" rx="2"/>
+                <circle cx="8.5" cy="8.5" r="1.5"/><path d="M21 15l-5-5L5 21"/>
+              </svg>
+            </div>
+          )}
+          <div className="px-2 py-1.5 flex flex-col gap-0.5">
+            {p.caption_or_description && (
+              <p className="text-[10px] text-gray-700 font-medium leading-tight line-clamp-2">{p.caption_or_description}</p>
+            )}
+            {(p.location_or_area || p.photo_date_display) && (
+              <p className="text-[9px] text-gray-400 leading-tight">
+                {[p.location_or_area, p.photo_date_display].filter(Boolean).join(' · ')}
+              </p>
+            )}
+          </div>
+        </div>
+      ))}
+    </div>
+  )
+}
+
+function SmartFallback({ ast, type }: { ast: Record<string, unknown>; type: string | null }) {
+  const inferred = inferWidgetType(ast)
+  if (inferred) {
+    switch (inferred) {
+      case 'line_chart':           return <LineChartWidget ast={ast} />
+      case 'area_chart':           return <AreaChartWidget ast={ast} />
+      case 'bar_chart':            return <BarChartWidget ast={ast} />
+      case 'stacked_bar_chart':    return <BarChartWidget ast={ast} stacked />
+      case 'horizontal_bar_chart': return <BarChartWidget ast={ast} horizontal />
+      case 'donut_chart':          return <DonutChartWidget ast={ast} />
+      case 'data_table':           return <DataTableWidget ast={ast} />
+      case 'milestone_table':      return <MilestoneTableWidget ast={ast} />
+      case 'exception_table':      return <ExceptionTableWidget ast={ast} />
+      case 'kpi_card':             return <KpiCardWidget ast={ast} />
+      case 'status_summary':       return <StatusSummaryWidget ast={ast} />
+      case 'narrative_summary':    return <NarrativeSummaryWidget ast={ast} />
+      case 'alert_panel':          return <AlertPanelWidget ast={ast} />
+      case 'text_block':           return <TextBlockWidget ast={ast} />
+      case 'progress_bar':         return <ProgressBarWidget ast={ast} />
+      case 'trade_schedule_gantt': return <TradeScheduleGanttWidget ast={ast} />
+    }
+  }
+  // No match — clean placeholder (never shows raw JSON in production)
+  return (
+    <div className="flex flex-col items-center justify-center h-24 gap-1 text-gray-300">
+      <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.5">
+        <rect x="3" y="3" width="18" height="18" rx="2" />
+        <path d="M9 9h.01M15 9h.01M9 15h6" />
+      </svg>
+      <span className="text-[10px] text-gray-400 italic">
+        {type ? `Widget type "${type}" not yet supported` : 'Unknown widget'}
+      </span>
+    </div>
+  )
+}
+
+// narrative_summary — content.items[]: { id, order, title, category, severity, narrative, evidence[], required_action, navigation }
+function NarrativeSummaryWidget({ ast }: { ast: Record<string, unknown> }) {
+  const content = getContent(ast)
+  type EvidenceItem = { label: string; value: unknown; unit?: string | null; data_type?: string }
+  type NarrativeItem = {
+    id?: string
+    order?: number
+    title?: string
+    category?: string
+    severity?: string
+    narrative?: string
+    evidence?: EvidenceItem[]
+    required_action?: string
+    navigation?: { label?: string; target_page_id?: string }
+  }
+  const heading  = content.heading  as string | undefined
+  const subtitle = content.subtitle as string | undefined
+  const footerNote = content.footer_note as string | undefined
+  const items = (content.items ?? []) as NarrativeItem[]
+  if (!items.length) return <NoData />
+
+  return (
+    <div className="space-y-3">
+      {heading && <p className="text-xs font-semibold text-gray-700">{heading}</p>}
+      {subtitle && <p className="text-[11px] text-gray-500 leading-relaxed">{subtitle}</p>}
+      {items
+        .slice()
+        .sort((a, b) => (a.order ?? 0) - (b.order ?? 0))
+        .map((item, i) => {
+          const sev = item.severity ?? 'info'
+          const isCritical = sev === 'critical' || sev === 'error'
+          const isWarning  = sev === 'warning'
+          const borderCls  = isCritical ? 'border-red-300'  : isWarning ? 'border-amber-300'  : 'border-blue-200'
+          const bgCls      = isCritical ? 'bg-red-50'       : isWarning ? 'bg-amber-50'       : 'bg-blue-50'
+          const badgeCls   = isCritical ? 'bg-red-100 text-red-700' : isWarning ? 'bg-amber-100 text-amber-700' : 'bg-blue-100 text-blue-700'
+          const actionCls  = isCritical ? 'border-red-200 text-red-800' : isWarning ? 'border-amber-200 text-amber-800' : 'border-blue-200 text-blue-800'
+          return (
+            <div key={item.id ?? i} className={`rounded-lg border ${borderCls} ${bgCls} px-4 py-3 space-y-2`}>
+              <div className="flex items-start justify-between gap-2">
+                <p className="text-xs font-semibold text-gray-800 leading-snug flex-1">{item.title}</p>
+                <span className={`text-[10px] font-semibold px-1.5 py-0.5 rounded capitalize flex-shrink-0 ${badgeCls}`}>{sev}</span>
+              </div>
+              {item.narrative && (
+                <p className="text-[11px] text-gray-600 leading-relaxed">{item.narrative}</p>
+              )}
+              {item.evidence && item.evidence.length > 0 && (
+                <div className="flex flex-wrap gap-x-4 gap-y-1 pt-1">
+                  {item.evidence.map((ev, j) => (
+                    <span key={j} className="text-[10px] text-gray-600">
+                      <span className="font-medium">{ev.label}:</span>{' '}
+                      {ev.value != null ? String(ev.value) : '—'}
+                      {ev.unit ? ` ${ev.unit}` : ''}
+                    </span>
+                  ))}
+                </div>
+              )}
+              {item.required_action && (
+                <div className={`mt-1 rounded border-l-2 pl-2 py-1 ${actionCls}`}>
+                  <span className="text-[10px] font-semibold uppercase tracking-wide">Required action: </span>
+                  <span className="text-[10px]">{item.required_action}</span>
+                </div>
+              )}
+            </div>
+          )
+        })}
+      {footerNote && (
+        <p className="text-[10px] text-gray-400 leading-relaxed italic pt-1">{footerNote}</p>
+      )}
+    </div>
+  )
+}
+
+// ── Widget sizing hint ────────────────────────────────────────────────────────
+// Returns a CSS grid column-span class for a 4-column grid.
+// small (1 col): KPI tiles, progress bars, single-metric cards
+// medium (2 col): charts
+// large (4 col / full): tables, alert panels, text blocks
+function colSpan(type: string | null): string {
+  switch (type) {
+    case 'kpi_card':
+    case 'progress_bar':
+      return 'col-span-1'
+    case 'kpi_group':
+    case 'status_summary':
+    case 'metadata_panel':
+    case 'donut_chart':
+    case 'pie_chart':
+      return 'col-span-2'
+    case 'line_chart':
+    case 'bar_chart':
+    case 'grouped_bar_chart':
+    case 'stacked_bar_chart':
+    case 'horizontal_bar_chart':
+    case 'area_chart':
+      return 'col-span-2'
+    case 'data_table':
+    case 'exception_table':
+    case 'milestone_table':
+    case 'lookahead_table':
+    case 'hierarchical_table':
+    case 'resource_table':
+    case 'alert_panel':
+    case 'narrative_summary':
+    case 'text_block':
+    default:
+      return 'col-span-4'
+  }
+}
+
+// ── Widget dispatcher ─────────────────────────────────────────────────────────
+
+// Renders just the widget content (no card wrapper) — used by both WidgetRenderer and A3WeeklyDashboardPage
+function WidgetInner({ widget }: { widget: DashboardWidget }) {
+  const ast  = widget.widget_ast ?? {}
+  const type = widget.widget_type
+  switch (type) {
+    case 'kpi_card':           return <KpiCardWidget ast={ast} />
+    case 'kpi_group':          return <KpiGroupWidget ast={ast} />
+    case 'metadata_panel':     return <MetadataPanelWidget ast={ast} />
+    case 'alert_panel':        return <AlertPanelWidget ast={ast} />
+    case 'status_summary':     return <StatusSummaryWidget ast={ast} />
+    case 'progress_bar':       return <ProgressBarWidget ast={ast} />
+    case 'line_chart':         return <LineChartWidget ast={ast} />
+    case 'bar_chart':
+    case 'grouped_bar_chart':  return <BarChartWidget ast={ast} />
+    case 'stacked_bar_chart':  return <BarChartWidget ast={ast} stacked />
+    case 'horizontal_bar_chart':return <BarChartWidget ast={ast} horizontal />
+    case 'area_chart':         return <AreaChartWidget ast={ast} />
+    case 'pie_chart':          return <DonutChartWidget ast={ast} />
+    case 'donut_chart':        return <DonutChartWidget ast={ast} />
+    case 'data_table':         return <DataTableWidget ast={ast} />
+    case 'exception_table':    return <ExceptionTableWidget ast={ast} />
+    case 'milestone_table':
+    case 'lookahead_table':    return <MilestoneTableWidget ast={ast} />
+    case 'hierarchical_table': return <HierarchicalTableWidget ast={ast} />
+    case 'resource_table':     return <ResourceTableWidget ast={ast} />
+    case 'narrative_summary':  return <NarrativeSummaryWidget ast={ast} />
+    case 'text_block':         return <TextBlockWidget ast={ast} />
+    case 'trade_schedule_gantt':return <TradeScheduleGanttWidget ast={ast} />
+    case 'photo_gallery':       return <PhotoGalleryWidget ast={ast} />
+    default:                   return <SmartFallback ast={ast} type={type} />
+  }
+}
+
+// Shared card title bar: widget title left, WGT-* code right
+function CardHeader({ title, widgetId, marginBottom = 10 }: { title: string; widgetId?: string | null; marginBottom?: number }) {
+  return (
+    <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom, flex: '0 1 auto', width: '100%', minWidth: 0 }}>
+      <p style={{ fontSize: 11, fontWeight: 700, color: '#64748b', textTransform: 'uppercase', letterSpacing: '0.07em', margin: 0, minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+        {title}
+      </p>
+      {widgetId && (
+        <span style={{
+          fontSize: 10, fontFamily: 'ui-monospace, "Cascadia Code", "Fira Code", monospace',
+          fontWeight: 600, color: '#475569',
+          background: '#f1f5f9', border: '1px solid #cbd5e1',
+          borderRadius: 4, padding: '1px 6px',
+          flexShrink: 0, marginLeft: 10, letterSpacing: '0.04em',
+          lineHeight: '16px',
+        }}>
+          {widgetId}
+        </span>
+      )}
+    </div>
+  )
+}
+
+function WidgetRenderer({ widget }: { widget: DashboardWidget }) {
+  const type = widget.widget_type
+
+  const isTable = [
+    'data_table','exception_table','milestone_table','lookahead_table',
+    'hierarchical_table','resource_table',
+  ].includes(type ?? '')
+
+  return (
+    <div className={`bg-white rounded-2xl border border-gray-100 shadow-sm p-4 flex flex-col ${colSpan(type)}`}>
+      {(widget.widget_title || widget.widget_id) && (
+        <div className="flex items-center justify-between mb-3 flex-shrink-0">
+          <p className="text-[10px] font-bold text-gray-400 uppercase tracking-widest leading-tight min-w-0 truncate">
+            {widget.widget_title ?? ''}
+          </p>
+          {widget.widget_id && (
+            <span className="flex-shrink-0 ml-2.5 font-mono font-semibold text-slate-600 bg-slate-100 border border-slate-300 rounded px-1.5 py-px text-[10px] leading-4 tracking-wide">
+              {widget.widget_id}
+            </span>
+          )}
+        </div>
+      )}
+      <div className={isTable ? 'flex-1 flex flex-col min-h-0' : ''}>
+        <WidgetInner widget={widget} />
+      </div>
+    </div>
+  )
+}
+
+// ── Executive Overview — full redesign ────────────────────────────────────────
+
+type ExecPageProps = {
+  page: StructurePlanPage
+  pageIdx: number
+  pageWidgets: DashboardWidget[]
+  structure: DashboardStructure
+  structures: DashboardStructure[]
+  selectedStructureId: string
+  onStructureChange: (e: React.ChangeEvent<HTMLSelectElement>) => void
+}
+
+function ExecutiveOverviewPage({
+  page: _page,
+  pageWidgets,
+  structure,
+  structures,
+  selectedStructureId,
+  onStructureChange,
+}: ExecPageProps) {
+  type KR = Record<string, unknown>
+  const tok = useContext(DesignContext)
+
+  // widget lookup
+  const w = (id: string) => pageWidgets.find(x => x.widget_id === id)
+  const wgt001 = w('WGT-001')
+  const wgt002 = w('WGT-002')
+  const wgt003 = w('WGT-003')
+  const wgt005 = w('WGT-005')
+  const wgt006 = w('WGT-006')
+  const wgt007 = w('WGT-007')
+  const wgt051 = w('WGT-051')
+
+  // ── WGT-001 header ───────────────────────────────────────────────────────────
+  const metaC = wgt001 ? getContent(wgt001.widget_ast ?? {}) : null
+  // content.items is the array of display fields; content.fields is a flat key-value object — always prefer items
+  const _metaRaw = metaC?.items ?? metaC?.fields
+  const metaItems: { key?: string; label?: string; value: unknown }[] = Array.isArray(_metaRaw) ? _metaRaw : []
+  const m = (key: string) => metaItems.find(f => f.key === key)?.value
+  const projectName = String(m('project_name') ?? structure.dashboard_title ?? 'Project Report')
+  const period      = String(m('reporting_period_label') ?? '')
+  const dataDate    = String(m('data_date') ?? structure.data_date ?? '')
+  const weekNum     = m('week_num') ?? structure.week_num
+
+  // ── KPI helpers ───────────────────────────────────────────────────────────────
+  const itemsOf = (wgt: typeof wgt001): KR[] => {
+    if (!wgt) return []
+    const c = getContent(wgt.widget_ast ?? {})
+    const raw = c.items ?? c.kpis ?? c.metrics
+    return Array.isArray(raw) ? (raw as KR[]) : []
+  }
+  const v = (item: KR, dec = 2) => {
+    const val = item.value
+    if (val == null) return '—'
+    const n = Number(val)
+    return isNaN(n) ? String(val) : n % 1 === 0 ? String(n) : n.toFixed(dec)
+  }
+  const chip = (item: KR, posGood = true) => {
+    const n = Number(item.variance)
+    if (isNaN(n) || item.variance == null) return null
+    const unit = String(item.variance_unit ?? item.unit ?? '')
+    const txt = `${n >= 0 ? '+' : ''}${n % 1 === 0 ? n : n.toFixed(2)}${unit ? ' ' + unit : ''}`
+    return { txt, good: posGood ? n >= 0 : n <= 0 }
+  }
+
+  // ── WGT-002 progress ─────────────────────────────────────────────────────────
+  const progItems = itemsOf(wgt002)
+  const pPlanned  = progItems.find(x => x.key === 'overall_planned_progress')  ?? progItems[0] ?? {}
+  const pActual   = progItems.find(x => x.key === 'overall_actual_progress')   ?? progItems[1] ?? {}
+  const pVar      = progItems.find(x => x.key === 'progress_variance')         ?? progItems[2] ?? {}
+
+  // ── WGT-003 schedule ─────────────────────────────────────────────────────────
+  const schItems  = itemsOf(wgt003)
+  const sForecast = schItems.find(x => x.key === 'forecast_completion_date')   ?? schItems[0] ?? {}
+  const sDelay    = schItems.find(x => x.key === 'current_project_delay_days') ?? schItems[1] ?? {}
+  const sCrit     = schItems.find(x => x.key === 'critical_activity_count')    ?? schItems[2] ?? {}
+  const sStatus   = schItems.find(x => x.key === 'schedule_status')            ?? schItems[3] ?? {}
+
+  // ── WGT-005 engineering ───────────────────────────────────────────────────────
+  const engC     = wgt005 ? getContent(wgt005.widget_ast ?? {}) : null
+  const engPrim  = Array.isArray(engC?.primary_metrics) ? (engC!.primary_metrics as KR[]) : []
+  const engCtx   = Array.isArray(engC?.context_metrics) ? (engC!.context_metrics as KR[]) : []
+  const engDistRaw = (engC?.status_distribution as KR | null)?.segments
+  const engDist  = Array.isArray(engDistRaw) ? (engDistRaw as KR[]) : []
+  const engTotM  = engCtx.find(x => x.key === 'total_transmittals')
+  const engTotal = Number(engTotM?.value ?? 0)
+  const ePlanned = engPrim.find(x => x.key === 'planned_submissions_to_date')
+  const eSubmit  = engPrim.find(x => x.key === 'submitted_to_date')
+  const eOverdue = engPrim.find(x => x.key === 'overdue_not_submitted')
+  const eUR      = engCtx.find(x => x.key === 'under_review_over_14_days')
+  const eSTC     = engCtx.find(x => x.key === 'status_c_not_resubmitted_over_14_days')
+  const ENG_COLORS: Record<string, string> = { A: '#10b981', B: '#3b82f6', C: '#f59e0b', D: '#9ca3af', UR: '#ef4444' }
+
+  // ── WGT-006 QA/QC ────────────────────────────────────────────────────────────
+  const qaC       = wgt006 ? getContent(wgt006.widget_ast ?? {}) : null
+  const qaSum     = (qaC?.summary ?? {}) as KR
+  const qaSupMet  = Array.isArray(qaC?.supporting_metrics) ? (qaC!.supporting_metrics as KR[]) : []
+
+  // ── WGT-007 exceptions ────────────────────────────────────────────────────────
+  const excC      = wgt007 ? getContent(wgt007.widget_ast ?? {}) : null
+  const excRows   = Array.isArray(excC?.rows) ? (excC!.rows as KR[]) : []
+  const excTotals = (excC?.source_exception_totals ?? {}) as KR
+
+  // ── WGT-002 previous-week comparison data ─────────────────────────────────────
+  const compBasis = (() => {
+    if (!wgt002) return null
+    const c = getContent(wgt002.widget_ast ?? {})
+    return c.comparison_basis as KR | null
+  })()
+  const prevWeekNum   = compBasis?.previous_reporting_week_num
+  const prevCutoff    = compBasis?.previous_reporting_cutoff as string | undefined
+  const prevPlanned   = (compBasis?.baseline_period_for_previous_cutoff as KR | undefined)?.cumulative_planned_percent
+  const prevActual    = (compBasis?.actual_period_for_previous_cutoff   as KR | undefined)?.cumulative_actual_percent
+  const currPlanned   = Number(pPlanned.value ?? 0)
+  const currActual    = Number(pActual.value  ?? 0)
+
+  // ── shared style tokens — driven by design specification ─────────────────────
+  const CARD: React.CSSProperties = {
+    background: tok('surface_primary', '#ffffff'),
+    borderRadius: 16,
+    border: `1px solid ${tok('subtle_border', '#e2e8f0')}`,
+    boxShadow: '0 1px 4px rgba(0,0,0,0.06)',
+    padding: '16px 18px',
+    overflow: 'hidden',
+  }
+  const ROW_LABEL: React.CSSProperties = { fontSize: 13, color: tok('text_secondary', '#64748b') }
+  const ROW_VAL: React.CSSProperties   = { fontSize: 13, fontWeight: 700, color: tok('text_primary', '#1e293b') }
+
+  return (
+    <div style={{ fontFamily: '-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif', color: tok('text_primary', '#1e293b'), background: tok('canvas', '#f1f5f9'), minHeight: '100%' }}>
+
+      {/* ══════════════════════════════════════════════════════════════════════
+          TOP NAV BAR
+      ══════════════════════════════════════════════════════════════════════ */}
+      <div style={{ background: tok('app_header_bg', '#fff'), borderBottom: `1px solid ${tok('subtle_border', '#e2e8f0')}`, padding: '10px 24px', display: 'flex', alignItems: 'center', gap: 12 }}>
+        {/* Branding */}
+        <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+          <div style={{ width: 28, height: 28, borderRadius: 6, background: `linear-gradient(135deg, ${tok('charcoal', '#1e40af')}, ${tok('primary', '#3b82f6')})`, display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="#fff" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round">
+              <path d="M3 3h18M3 9h18M3 15h12M3 21h8" />
+            </svg>
+          </div>
+          <span style={{ fontSize: 14, fontWeight: 700, color: tok('text_primary', '#1e293b'), letterSpacing: '-0.01em' }}>P6 Control</span>
+          <span style={{ fontSize: 13, color: tok('muted_text', '#94a3b8') }}>/</span>
+          <span style={{ fontSize: 13, color: tok('text_secondary', '#64748b') }}>{projectName}</span>
+        </div>
+
+        <div style={{ flex: 1 }} />
+
+        {/* Metadata pills */}
+        <div style={{ display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' }}>
+          {weekNum != null && (
+            <span style={{ fontSize: 12, fontWeight: 600, padding: '3px 10px', borderRadius: 99, background: '#eff6ff', color: '#1d4ed8', border: '1px solid #bfdbfe' }}>
+              Week {String(weekNum)}
+            </span>
+          )}
+          <span style={{ fontSize: 12, color: '#64748b', fontWeight: 500 }}>
+            Data Date: <strong style={{ color: '#1e293b' }}>{fmtDate(dataDate)}</strong>
+          </span>
+          {structure.is_approved && (
+            <span style={{ fontSize: 12, fontWeight: 600, padding: '3px 10px', borderRadius: 99, background: '#f0fdf4', color: '#15803d', border: '1px solid #bbf7d0', display: 'inline-flex', alignItems: 'center', gap: 4 }}>
+              <svg width="10" height="10" viewBox="0 0 20 20" fill="currentColor"><path fillRule="evenodd" d="M16.707 5.293a1 1 0 010 1.414l-8 8a1 1 0 01-1.414 0l-4-4a1 1 0 011.414-1.414L8 12.586l7.293-7.293a1 1 0 011.414 0z" clipRule="evenodd" /></svg>
+              Approved
+            </span>
+          )}
+          {/* Report selector */}
+          <select
+            value={selectedStructureId}
+            onChange={onStructureChange}
+            style={{ fontSize: 11, color: '#374151', background: '#f8fafc', border: '1px solid #e2e8f0', borderRadius: 6, padding: '4px 8px', outline: 'none' }}
+          >
+            {structures.map(s => (
+              <option key={s.structure_id} value={s.structure_id}>
+                {s.week_num != null ? `Week ${s.week_num}` : 'Week —'} · {fmtDate(s.data_date)}
+              </option>
+            ))}
+          </select>
+          {/* Print button */}
+          <button
+            onClick={() => { requestAnimationFrame(() => requestAnimationFrame(() => setTimeout(() => window.print(), 300))) }}
+            style={{ display: 'inline-flex', alignItems: 'center', gap: 5, fontSize: 11, fontWeight: 600, padding: '5px 12px', borderRadius: 6, background: '#1e293b', color: '#fff', border: 'none', cursor: 'pointer' }}
+          >
+            <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+              <path d="M6 9V2h12v7M6 18H4a2 2 0 01-2-2v-5a2 2 0 012-2h16a2 2 0 012 2v5a2 2 0 01-2 2h-2" />
+              <rect x="6" y="14" width="12" height="8" rx="1" />
+            </svg>
+            Print / PDF
+          </button>
+        </div>
+      </div>
+
+      {/* ══════════════════════════════════════════════════════════════════════
+          PAGE TITLE BLOCK
+      ══════════════════════════════════════════════════════════════════════ */}
+      <div style={{ background: '#fff', border: '1px solid #e2e8f0', borderRadius: 16, padding: '18px 24px 16px', marginBottom: 4 }}>
+        <div style={{ display: 'flex', alignItems: 'flex-start', justifyContent: 'space-between' }}>
+          <div>
+            <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 4 }}>
+              <div style={{ width: 4, height: 24, borderRadius: 2, background: 'linear-gradient(180deg, #1e40af, #3b82f6)' }} />
+              <h1 style={{ fontSize: 22, fontWeight: 800, color: '#0f172a', margin: 0, letterSpacing: '-0.02em' }}>Executive Overview</h1>
+            </div>
+            <p style={{ fontSize: 13, color: '#64748b', margin: '0 0 0 12px', fontStyle: 'italic' }}>
+              Current project posture, schedule and executive exceptions.
+            </p>
+          </div>
+          <div style={{ textAlign: 'right' }}>
+            <p style={{ fontSize: 11, color: '#94a3b8', margin: '0 0 2px' }}>Reporting Period</p>
+            <p style={{ fontSize: 13, fontWeight: 700, color: '#1e293b', margin: 0 }}>{period || `Week ${String(weekNum ?? '—')}`}</p>
+          </div>
+        </div>
+      </div>
+
+      {/* ══════════════════════════════════════════════════════════════════════
+          BODY CONTENT
+      ══════════════════════════════════════════════════════════════════════ */}
+      <div style={{ padding: '20px 24px', display: 'flex', flexDirection: 'column', gap: 16 }}>
+
+        {/* ── Project & Reporting Identification ─────────────────────────────── */}
+        <div style={{ ...CARD }}>
+          <CardHeader title={wgt001?.widget_title ?? 'Project and Reporting Identification'} widgetId={wgt001?.widget_id} />
+          <div style={{ display: 'grid', gridTemplateColumns: 'repeat(4, 1fr)', gap: '10px 20px' }}>
+            {metaItems.map((f, i) => (
+              <div key={i}>
+                <p style={{ fontSize: 11, color: '#94a3b8', fontWeight: 700, textTransform: 'uppercase', letterSpacing: '0.05em', marginBottom: 3 }}>{String(f.label ?? f.key ?? '')}</p>
+                <p style={{ fontSize: 13, fontWeight: 600, color: '#1e293b', margin: 0, wordBreak: 'break-word' }}>{String(f.value ?? '—')}</p>
+              </div>
+            ))}
+          </div>
+        </div>
+
+        {/* ── Overall Progress Position ──────────────────────────────────────── */}
+        <div style={{ ...CARD }}>
+          <CardHeader title={wgt002?.widget_title ?? 'Overall Progress Position'} widgetId={wgt002?.widget_id} />
+          <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr 1fr', gap: 12 }}>
+
+            {/* Planned */}
+            {(() => {
+              const d = chip(pPlanned)
+              return (
+                <div style={{ background: '#f8fafc', borderRadius: 8, border: '1px solid #e2e8f0', padding: '14px 16px', borderTop: '3px solid #3b82f6' }}>
+                  <p style={{ fontSize: 13, color: '#64748b', fontWeight: 600, marginBottom: 8 }}>Planned Progress (Cumulative)</p>
+                  <div style={{ display: 'flex', alignItems: 'baseline', gap: 4, marginBottom: 6 }}>
+                    <span style={{ fontSize: 32, fontWeight: 800, color: '#1e293b', lineHeight: 1 }}>{v(pPlanned)}</span>
+                    <span style={{ fontSize: 14, color: '#94a3b8', fontWeight: 500 }}>%</span>
+                    {d && <span style={{ marginLeft: 6, fontSize: 12, fontWeight: 700, padding: '2px 8px', borderRadius: 99, background: d.good ? '#f0fdf4' : '#fef2f2', color: d.good ? '#15803d' : '#b91c1c' }}>{d.txt}</span>}
+                  </div>
+                  {pPlanned.comparison_value != null && (
+                    <div style={{ borderTop: '1px solid #e2e8f0', paddingTop: 8, display: 'flex', flexDirection: 'column', gap: 4 }}>
+                      <div style={{ display: 'flex', justifyContent: 'space-between' }}>
+                        <span style={{ ...ROW_LABEL }}>Previous Week</span>
+                        <span style={{ ...ROW_VAL }}>{fmtNum(pPlanned.comparison_value)} %</span>
+                      </div>
+                      <div style={{ display: 'flex', justifyContent: 'space-between' }}>
+                        <span style={{ ...ROW_LABEL }}>Weekly Increment</span>
+                        <span style={{ ...ROW_VAL, color: '#3b82f6' }}>+{fmtNum(pPlanned.variance)} pp</span>
+                      </div>
+                    </div>
+                  )}
+                </div>
+              )
+            })()}
+
+            {/* Actual */}
+            {(() => {
+              const d = chip(pActual)
+              return (
+                <div style={{ background: '#f8fafc', borderRadius: 8, border: '1px solid #e2e8f0', padding: '14px 16px', borderTop: '3px solid #10b981' }}>
+                  <p style={{ fontSize: 13, color: '#64748b', fontWeight: 600, marginBottom: 8 }}>Actual Progress (Cumulative)</p>
+                  <div style={{ display: 'flex', alignItems: 'baseline', gap: 4, marginBottom: 6 }}>
+                    <span style={{ fontSize: 32, fontWeight: 800, color: '#1e293b', lineHeight: 1 }}>{v(pActual)}</span>
+                    <span style={{ fontSize: 14, color: '#94a3b8', fontWeight: 500 }}>%</span>
+                    {d && <span style={{ marginLeft: 6, fontSize: 12, fontWeight: 700, padding: '2px 8px', borderRadius: 99, background: d.good ? '#f0fdf4' : '#fef2f2', color: d.good ? '#15803d' : '#b91c1c' }}>{d.txt}</span>}
+                  </div>
+                  {pActual.comparison_value != null && (
+                    <div style={{ borderTop: '1px solid #e2e8f0', paddingTop: 8, display: 'flex', flexDirection: 'column', gap: 4 }}>
+                      <div style={{ display: 'flex', justifyContent: 'space-between' }}>
+                        <span style={{ ...ROW_LABEL }}>Previous Week</span>
+                        <span style={{ ...ROW_VAL }}>{fmtNum(pActual.comparison_value)} %</span>
+                      </div>
+                      <div style={{ display: 'flex', justifyContent: 'space-between' }}>
+                        <span style={{ ...ROW_LABEL }}>Weekly Increment</span>
+                        <span style={{ ...ROW_VAL, color: '#10b981' }}>+{fmtNum(pActual.variance)} pp</span>
+                      </div>
+                    </div>
+                  )}
+                </div>
+              )
+            })()}
+
+            {/* Variance */}
+            {(() => {
+              const varNeg = Number(pVar.value) < 0
+              return (
+                <div style={{ background: varNeg ? '#fef2f2' : '#f0fdf4', borderRadius: 8, border: `1px solid ${varNeg ? '#fecaca' : '#bbf7d0'}`, padding: '14px 16px', borderTop: `3px solid ${varNeg ? '#ef4444' : '#10b981'}` }}>
+                  <p style={{ fontSize: 13, color: '#64748b', fontWeight: 600, marginBottom: 8 }}>Progress Variance (Actual − Planned)</p>
+                  <div style={{ display: 'flex', alignItems: 'baseline', gap: 4, marginBottom: 6 }}>
+                    <span style={{ fontSize: 32, fontWeight: 800, color: varNeg ? '#dc2626' : '#15803d', lineHeight: 1 }}>{v(pVar)}</span>
+                    <span style={{ fontSize: 14, color: '#94a3b8', fontWeight: 500 }}>pp</span>
+                  </div>
+                  {!!pVar.status_label && (
+                    <span style={{ display: 'inline-block', fontSize: 12, fontWeight: 700, padding: '3px 9px', borderRadius: 99, background: varNeg ? '#fef2f2' : '#f0fdf4', border: `1px solid ${varNeg ? '#fecaca' : '#bbf7d0'}`, color: varNeg ? '#b91c1c' : '#15803d', marginBottom: 8 }}>
+                      {String(pVar.status_label)}
+                    </span>
+                  )}
+                  <div style={{ borderTop: `1px solid ${varNeg ? '#fecaca' : '#bbf7d0'}`, paddingTop: 8, display: 'flex', flexDirection: 'column', gap: 4 }}>
+                    <div style={{ display: 'flex', justifyContent: 'space-between' }}>
+                      <span style={{ ...ROW_LABEL }}>Planned</span>
+                      <span style={{ ...ROW_VAL }}>{v(pPlanned)} %</span>
+                    </div>
+                    <div style={{ display: 'flex', justifyContent: 'space-between' }}>
+                      <span style={{ ...ROW_LABEL }}>Actual</span>
+                      <span style={{ ...ROW_VAL }}>{v(pActual)} %</span>
+                    </div>
+                  </div>
+                </div>
+              )
+            })()}
+          </div>
+        </div>
+
+        {/* ── Executive Schedule Position ────────────────────────────────────── */}
+        <div style={{ ...CARD }}>
+          <CardHeader title={wgt003?.widget_title ?? 'Executive Schedule Position'} widgetId={wgt003?.widget_id} />
+          <div style={{ display: 'grid', gridTemplateColumns: 'repeat(4, 1fr)', gap: 12, marginBottom: 14 }}>
+
+            {/* Forecast Completion */}
+            <div style={{ background: '#f8fafc', borderRadius: 8, border: '1px solid #e2e8f0', padding: '14px 16px', borderTop: '3px solid #6366f1' }}>
+              <p style={{ fontSize: 13, color: '#64748b', fontWeight: 600, marginBottom: 8 }}>{String(sForecast.label ?? 'Forecast Completion Date')}</p>
+              <p style={{ fontSize: 20, fontWeight: 800, color: '#1e293b', lineHeight: 1.2 }}>{String(sForecast.value ?? '—')}</p>
+            </div>
+
+            {/* Project Delay */}
+            <div style={{ background: '#fffbeb', borderRadius: 8, border: '1px solid #fde68a', padding: '14px 16px', borderTop: '3px solid #f59e0b' }}>
+              <p style={{ fontSize: 13, color: '#64748b', fontWeight: 600, marginBottom: 8 }}>{String(sDelay.label ?? 'Current Project Delay')}</p>
+              <div style={{ display: 'flex', alignItems: 'baseline', gap: 4 }}>
+                <span style={{ fontSize: 32, fontWeight: 800, color: '#d97706', lineHeight: 1 }}>{v(sDelay, 0)}</span>
+                <span style={{ fontSize: 13, color: '#94a3b8' }}>days</span>
+              </div>
+            </div>
+
+            {/* Critical Activities */}
+            {(() => {
+              const critD = chip(sCrit, false)
+              return (
+                <div style={{ background: '#f8fafc', borderRadius: 8, border: '1px solid #e2e8f0', padding: '14px 16px', borderTop: '3px solid #64748b' }}>
+                  <p style={{ fontSize: 13, color: '#64748b', fontWeight: 600, marginBottom: 8 }}>{String(sCrit.label ?? 'Critical Activities')}</p>
+                  <div style={{ display: 'flex', alignItems: 'baseline', gap: 6 }}>
+                    <span style={{ fontSize: 32, fontWeight: 800, color: '#1e293b', lineHeight: 1 }}>{v(sCrit, 0)}</span>
+                    <span style={{ fontSize: 13, color: '#94a3b8' }}>activities</span>
+                    {critD && <span style={{ fontSize: 12, fontWeight: 700, padding: '2px 8px', borderRadius: 99, background: critD.good ? '#f0fdf4' : '#fef2f2', color: critD.good ? '#15803d' : '#b91c1c' }}>{critD.txt}</span>}
+                  </div>
+                  {sCrit.comparison_value != null && (
+                    <p style={{ fontSize: 12, color: '#94a3b8', marginTop: 6 }}>Previous week: {String(sCrit.comparison_value)}</p>
+                  )}
+                </div>
+              )
+            })()}
+
+            {/* Schedule Status */}
+            <div style={{ background: '#fff7ed', borderRadius: 8, border: '1px solid #fed7aa', padding: '14px 16px', borderTop: '3px solid #ea580c' }}>
+              <p style={{ fontSize: 13, color: '#64748b', fontWeight: 600, marginBottom: 8 }}>{String(sStatus.label ?? 'Schedule Status')}</p>
+              <span style={{ display: 'inline-block', fontSize: 16, fontWeight: 800, padding: '5px 14px', borderRadius: 6, background: '#fff', border: '1px solid #fed7aa', color: '#c2410c' }}>
+                {String(sStatus.value ?? '—')}
+              </span>
+            </div>
+          </div>
+        </div>
+
+        {/* ── Previous Reporting Week Comparison ────────────────────────────── */}
+        {compBasis && (
+          <div style={{ ...CARD }}>
+            <CardHeader title="Previous Reporting Week Comparison" />
+            <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 12 }}>
+
+              {/* Planned comparison */}
+              <div style={{ background: '#f8fafc', borderRadius: 8, border: '1px solid #e2e8f0', padding: '14px 16px' }}>
+                <p style={{ fontSize: 11, color: '#64748b', fontWeight: 700, marginBottom: 10 }}>
+                  Planned Progress — W{String(prevWeekNum ?? '')} vs W{String(weekNum ?? '')}
+                </p>
+                <div style={{ display: 'flex', alignItems: 'center', gap: 12 }}>
+                  <div style={{ textAlign: 'center' }}>
+                    <p style={{ fontSize: 12, color: '#94a3b8', marginBottom: 3 }}>W{String(prevWeekNum ?? '')} · {fmtDate(prevCutoff)}</p>
+                    <p style={{ fontSize: 22, fontWeight: 800, color: '#1e293b' }}>{fmtNum(prevPlanned)} %</p>
+                  </div>
+                  <div style={{ flex: 1, height: 2, background: '#e2e8f0', position: 'relative' }}>
+                    <div style={{ position: 'absolute', top: -8, left: '50%', transform: 'translateX(-50%)', fontSize: 11, fontWeight: 700, color: '#3b82f6', background: '#fff', padding: '2px 6px', borderRadius: 4, border: '1px solid #bfdbfe', whiteSpace: 'nowrap' }}>
+                      +{fmtNum(currPlanned - Number(prevPlanned ?? 0))} pp
+                    </div>
+                  </div>
+                  <div style={{ textAlign: 'center' }}>
+                    <p style={{ fontSize: 12, color: '#94a3b8', marginBottom: 3 }}>W{String(weekNum ?? '')} · {fmtDate(dataDate)}</p>
+                    <p style={{ fontSize: 22, fontWeight: 800, color: '#1e293b' }}>{fmtNum(currPlanned)} %</p>
+                  </div>
+                </div>
+              </div>
+
+              {/* Actual comparison */}
+              <div style={{ background: '#f8fafc', borderRadius: 8, border: '1px solid #e2e8f0', padding: '14px 16px' }}>
+                <p style={{ fontSize: 11, color: '#64748b', fontWeight: 700, marginBottom: 10 }}>
+                  Actual Progress — W{String(prevWeekNum ?? '')} vs W{String(weekNum ?? '')}
+                </p>
+                <div style={{ display: 'flex', alignItems: 'center', gap: 12 }}>
+                  <div style={{ textAlign: 'center' }}>
+                    <p style={{ fontSize: 12, color: '#94a3b8', marginBottom: 3 }}>W{String(prevWeekNum ?? '')} · {fmtDate(prevCutoff)}</p>
+                    <p style={{ fontSize: 22, fontWeight: 800, color: '#1e293b' }}>{fmtNum(prevActual)} %</p>
+                  </div>
+                  <div style={{ flex: 1, height: 2, background: '#e2e8f0', position: 'relative' }}>
+                    <div style={{ position: 'absolute', top: -8, left: '50%', transform: 'translateX(-50%)', fontSize: 11, fontWeight: 700, color: '#10b981', background: '#fff', padding: '2px 6px', borderRadius: 4, border: '1px solid #bbf7d0', whiteSpace: 'nowrap' }}>
+                      +{fmtNum(currActual - Number(prevActual ?? 0))} pp
+                    </div>
+                  </div>
+                  <div style={{ textAlign: 'center' }}>
+                    <p style={{ fontSize: 12, color: '#94a3b8', marginBottom: 3 }}>W{String(weekNum ?? '')} · {fmtDate(dataDate)}</p>
+                    <p style={{ fontSize: 22, fontWeight: 800, color: '#1e293b' }}>{fmtNum(currActual)} %</p>
+                  </div>
+                </div>
+              </div>
+            </div>
+          </div>
+        )}
+
+        {/* ── Overall Engineering Submissions ────────────────────────────────── */}
+        <div style={{ ...CARD }}>
+          <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 14 }}>
+            <CardHeader title={wgt005?.widget_title ?? 'Overall Engineering Submissions'} widgetId={wgt005?.widget_id} marginBottom={0} />
+            {engTotal > 0 && (
+              <span style={{ fontSize: 12, fontWeight: 700, color: '#64748b' }}>
+                Total Register: <strong style={{ color: '#1e293b', fontSize: 14 }}>{engTotal}</strong> transmittals
+              </span>
+            )}
+          </div>
+
+          {/* If the expected primary_metrics structure is absent, fall back to the generic StatusSummaryWidget */}
+          {engPrim.length === 0 && engDist.length === 0 && wgt005 && (
+            <StatusSummaryWidget ast={wgt005.widget_ast ?? {}} />
+          )}
+          {/* 3 primary KPIs */}
+          {engPrim.length > 0 && (
+          <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr 1fr', gap: 12, marginBottom: 14 }}>
+            {[ePlanned, eSubmit, eOverdue].map((mm, i) => {
+              if (!mm) return <div key={i} />
+              const isOvd = mm.key === 'overdue_not_submitted'
+              const isAct = mm.key === 'submitted_to_date'
+              const supporting = mm.supporting_metric as KR | undefined
+              return (
+                <div key={i} style={{
+                  borderRadius: 8, padding: '14px 16px',
+                  background: isOvd ? '#fef2f2' : '#f8fafc',
+                  border: `1px solid ${isOvd ? '#fecaca' : '#e2e8f0'}`,
+                  borderTop: `3px solid ${isOvd ? '#ef4444' : isAct ? '#10b981' : '#3b82f6'}`,
+                }}>
+                  <p style={{ fontSize: 13, color: '#64748b', fontWeight: 600, marginBottom: 8 }}>{String(mm.label ?? '')}</p>
+                  <p style={{ fontSize: 30, fontWeight: 800, lineHeight: 1, color: isOvd ? '#dc2626' : '#1e293b', marginBottom: supporting ? 6 : 0 }}>{String(mm.value ?? '—')}</p>
+                  {supporting && (
+                    <p style={{ fontSize: 12, color: '#64748b' }}>{fmtNum(supporting.value as number, 1)}% of planned</p>
+                  )}
+                </div>
+              )
+            })}
+          </div>
+          )}
+
+          {/* Status distribution bar */}
+          {engDist.length > 0 && (() => {
+            const total = engDist.reduce((s, sg) => s + Number(sg.count ?? 0), 0)
+            const allSegs = engDist
+            return (
+              <div style={{ marginBottom: 14 }}>
+                <p style={{ fontSize: 12, color: '#64748b', fontWeight: 600, marginBottom: 6 }}>Status Distribution (by recorded status code)</p>
+                <div style={{ display: 'flex', height: 10, borderRadius: 5, overflow: 'hidden', marginBottom: 8 }}>
+                  {allSegs.map((sg, i) => (
+                    <div key={i} style={{
+                      flex: total > 0 ? Number(sg.count) / total : 0,
+                      background: ENG_COLORS[String(sg.code ?? '')] ?? '#9ca3af',
+                      minWidth: Number(sg.count) > 0 ? 2 : 0,
+                    }} />
+                  ))}
+                </div>
+                <div style={{ display: 'flex', gap: 12, flexWrap: 'wrap' }}>
+                  {allSegs.map((sg, i) => (
+                    <span key={i} style={{ fontSize: 12, color: '#64748b', display: 'flex', alignItems: 'center', gap: 5 }}>
+                      <span style={{ width: 10, height: 10, borderRadius: 3, display: 'inline-block', background: ENG_COLORS[String(sg.code ?? '')] ?? '#9ca3af', flexShrink: 0 }} />
+                      <strong style={{ color: '#1e293b', fontWeight: 700 }}>{String(sg.code ?? '')}</strong>
+                      {' — '}{String(sg.count ?? 0)}
+                      {Number(sg.share_of_categorised_percent ?? 0) > 0 && (
+                        <span style={{ color: '#94a3b8' }}>({fmtNum(sg.share_of_categorised_percent as number, 1)}%)</span>
+                      )}
+                    </span>
+                  ))}
+                </div>
+              </div>
+            )
+          })()}
+
+          {/* Threshold alerts */}
+          <div style={{ display: 'flex', gap: 10, flexWrap: 'wrap' }}>
+            {[eUR, eSTC].filter(Boolean).map((mm, i) => {
+              const isOvd = mm!.semantic === 'overdue'
+              return (
+                <div key={i} style={{ flex: '1 1 200px', background: isOvd ? '#fff7ed' : '#fffbeb', border: `1px solid ${isOvd ? '#fed7aa' : '#fde68a'}`, borderRadius: 8, padding: '10px 14px', display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+                  <span style={{ fontSize: 13, color: '#64748b', flex: 1 }}>{String(mm!.label ?? '')}</span>
+                  <span style={{ fontSize: 22, fontWeight: 800, color: isOvd ? '#ea580c' : '#d97706', marginLeft: 12 }}>{String(mm!.value ?? '—')}</span>
+                </div>
+              )
+            })}
+          </div>
+        </div>
+
+        {/* ── QA/QC + Exceptions — single-column stacked layout ─────────────── */}
+        <div style={{ display: 'flex', flexDirection: 'column', gap: 16 }}>
+
+          {/* QA/QC — full-width row 1 */}
+          {wgt006 && (
+          <div style={{ ...CARD }}>
+            <CardHeader title={wgt006.widget_title ?? 'Overall QA/QC Open vs Closed'} widgetId={wgt006.widget_id} marginBottom={8} />
+
+            {/* Donut chart — reads content.data + content.center_metric */}
+            <DonutChartWidget ast={wgt006.widget_ast ?? {}} />
+
+            {/* Summary metrics row */}
+            {(qaSum.total_documents != null || qaSum.open_count != null || qaSum.open_over_14_days != null) && (
+              <div style={{ display: 'grid', gridTemplateColumns: 'repeat(3, 1fr)', gap: 8, marginTop: 12 }}>
+                <div style={{ borderRadius: 6, padding: '9px 12px', background: '#f8fafc', border: '1px solid #e2e8f0' }}>
+                  <p style={{ fontSize: 11, color: '#94a3b8', fontWeight: 700, textTransform: 'uppercase', letterSpacing: '0.05em', marginBottom: 2 }}>Total Documents</p>
+                  <p style={{ fontSize: 22, fontWeight: 800, color: '#1e293b', margin: 0, lineHeight: 1 }}>{String(qaSum.total_documents ?? '—')}</p>
+                </div>
+                <div style={{ borderRadius: 6, padding: '9px 12px', background: '#f8fafc', border: '1px solid #e2e8f0' }}>
+                  <p style={{ fontSize: 11, color: '#94a3b8', fontWeight: 700, textTransform: 'uppercase', letterSpacing: '0.05em', marginBottom: 2 }}>Open</p>
+                  <p style={{ fontSize: 22, fontWeight: 800, color: '#1e293b', margin: 0, lineHeight: 1 }}>{String(qaSum.open_count ?? '—')}</p>
+                </div>
+                <div style={{ borderRadius: 6, padding: '9px 12px', background: '#fff7ed', border: '1px solid #fed7aa' }}>
+                  <p style={{ fontSize: 11, color: '#94a3b8', fontWeight: 700, textTransform: 'uppercase', letterSpacing: '0.05em', marginBottom: 2 }}>Open &gt; 14 Days</p>
+                  <p style={{ fontSize: 22, fontWeight: 800, color: '#ea580c', margin: 0, lineHeight: 1 }}>{String(qaSum.open_over_14_days ?? '—')}</p>
+                </div>
+              </div>
+            )}
+
+            {/* Supporting metrics (e.g. overdue alerts) */}
+            {qaSupMet.length > 0 && (
+              <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap', marginTop: 8 }}>
+                {qaSupMet.map((m, i) => (
+                  <div key={i} style={{ flex: '1 1 160px', borderRadius: 6, padding: '8px 12px', background: m.semantic_status === 'overdue' ? '#fff7ed' : '#f8fafc', border: `1px solid ${m.semantic_status === 'overdue' ? '#fed7aa' : '#e2e8f0'}`, display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+                    <span style={{ fontSize: 12, color: '#64748b' }}>{String(m.label ?? '')}</span>
+                    <span style={{ fontSize: 20, fontWeight: 800, color: m.semantic_status === 'overdue' ? '#ea580c' : '#1e293b', marginLeft: 8 }}>{String(m.value ?? '—')}</span>
+                  </div>
+                ))}
+              </div>
+            )}
+          </div>
+          )}
+
+          {/* Major Exceptions — full-width row 2 */}
+          {wgt007 && excRows.length > 0 && (() => {
+            // colour helpers keyed on age_basis
+            const rowAccent = (ageBasis: string) => {
+              const b = String(ageBasis ?? '').toLowerCase()
+              if (b.includes('overdue')) return { border: '#ef4444', ageBg: '#fef2f2', ageColor: '#dc2626' }
+              if (b.includes('under review')) return { border: '#f59e0b', ageBg: '#fffbeb', ageColor: '#d97706' }
+              if (b.includes('status c') || b.includes('since status')) return { border: '#f97316', ageBg: '#fff7ed', ageColor: '#ea580c' }
+              return { border: '#f59e0b', ageBg: '#fffbeb', ageColor: '#d97706' }
+            }
+            // group rows by domain, preserving source order
+            const domainOrder: string[] = []
+            const byDomain: Record<string, KR[]> = {}
+            excRows.forEach(r => {
+              const d = String(r.domain ?? 'Other')
+              if (!byDomain[d]) { domainOrder.push(d); byDomain[d] = [] }
+              byDomain[d].push(r)
+            })
+            // domain accent colours
+            const domainAccent: Record<string, { bg: string; border: string; text: string }> = {
+              'Construction Schedule': { bg: '#eff6ff', border: '#bfdbfe', text: '#1d4ed8' },
+              'Engineering':           { bg: '#f0fdf4', border: '#bbf7d0', text: '#15803d' },
+              'QA/QC & HSE':           { bg: '#fff7ed', border: '#fed7aa', text: '#c2410c' },
+            }
+            const defaultDomainAccent = { bg: '#f8fafc', border: '#e2e8f0', text: '#475569' }
+            // source totals summary pills
+            const eng  = (excTotals.engineering              ?? {}) as KR
+            const sch  = (excTotals.construction_schedule    ?? {}) as KR
+            const qa   = (excTotals.qaqc_hse                 ?? {}) as KR
+            const summaryPills = [
+              { label: 'Overdue Not Started',    value: sch.overdue_not_started_count,              accent: '#1d4ed8' },
+              { label: 'Overdue Not Submitted',  value: eng.overdue_not_submitted,                  accent: '#15803d' },
+              { label: 'Under Review >14d',      value: eng.under_review_over_14_days,              accent: '#d97706' },
+              { label: 'Status C Not Resubmitted', value: eng.status_c_not_resubmitted_over_14_days, accent: '#ea580c' },
+              { label: 'QA/QC Open >14d',        value: qa.open_over_14_days,                       accent: '#dc2626' },
+            ].filter(p => p.value != null && Number(p.value) > 0)
+
+            return (
+              <div style={{ ...CARD, padding: '16px 20px' }}>
+                <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start', marginBottom: 12 }}>
+                  <CardHeader title={wgt007.widget_title ?? ''} widgetId={wgt007.widget_id} marginBottom={0} />
+                  <span style={{ fontSize: 12, fontWeight: 700, padding: '3px 10px', borderRadius: 99, background: '#fef2f2', border: '1px solid #fecaca', color: '#b91c1c', flexShrink: 0, marginLeft: 12 }}>
+                    {excRows.length} shown
+                  </span>
+                </div>
+
+                {/* Source totals summary */}
+                {summaryPills.length > 0 && (
+                  <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap', marginBottom: 14 }}>
+                    {summaryPills.map((p, i) => (
+                      <div key={i} style={{ display: 'flex', alignItems: 'center', gap: 8, padding: '7px 12px', borderRadius: 8, background: '#f8fafc', border: '1px solid #e2e8f0', borderLeft: `3px solid ${p.accent}` }}>
+                        <span style={{ fontSize: 20, fontWeight: 800, color: p.accent, lineHeight: 1 }}>{String(p.value)}</span>
+                        <span style={{ fontSize: 11, color: '#64748b', lineHeight: 1.3 }}>{p.label}</span>
+                      </div>
+                    ))}
+                  </div>
+                )}
+
+                {/* Rows grouped by domain */}
+                <div style={{ display: 'flex', flexDirection: 'column', gap: 14 }}>
+                  {domainOrder.map(domain => {
+                    const da = domainAccent[domain] ?? defaultDomainAccent
+                    return (
+                      <div key={domain}>
+                        {/* Domain header */}
+                        <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 6 }}>
+                          <span style={{ fontSize: 11, fontWeight: 700, textTransform: 'uppercase', letterSpacing: '0.06em', padding: '3px 10px', borderRadius: 99, background: da.bg, border: `1px solid ${da.border}`, color: da.text }}>
+                            {domain}
+                          </span>
+                          <span style={{ fontSize: 11, color: '#94a3b8' }}>{byDomain[domain].length} items</span>
+                        </div>
+                        {/* Exception rows for this domain */}
+                        <div style={{ display: 'flex', flexDirection: 'column', gap: 5 }}>
+                          {byDomain[domain].map((ex, i) => {
+                            const ac = rowAccent(String(ex.age_basis ?? ''))
+                            return (
+                              <div key={i} style={{ display: 'flex', alignItems: 'flex-start', gap: 12, borderRadius: 8, background: '#f8fafc', border: '1px solid #e2e8f0', borderLeft: `4px solid ${ac.border}`, padding: '9px 12px' }}>
+                                <div style={{ flex: 1, minWidth: 0 }}>
+                                  <div style={{ display: 'flex', alignItems: 'center', gap: 6, marginBottom: 3, flexWrap: 'wrap' }}>
+                                    <span style={{ fontSize: 12, fontWeight: 700, color: '#0f172a' }}>{String(ex.reference ?? '')}</span>
+                                    {!!ex.record_type && (
+                                      <span style={{ fontSize: 10, fontWeight: 600, padding: '1px 6px', borderRadius: 4, background: '#fff', border: '1px solid #e2e8f0', color: '#475569', marginLeft: 'auto', flexShrink: 0 }}>
+                                        {String(ex.record_type)}
+                                      </span>
+                                    )}
+                                  </div>
+                                  <p style={{ fontSize: 12, color: '#475569', margin: '0 0 4px', lineHeight: 1.4 }}>{String(ex.description ?? '')}</p>
+                                  <div style={{ display: 'flex', gap: 4, flexWrap: 'wrap' }}>
+                                    {!!ex.exception_category && (
+                                      <span style={{ fontSize: 10, color: '#64748b', fontStyle: 'italic' }}>{String(ex.exception_category)}</span>
+                                    )}
+                                    {!!ex.discipline_code && (
+                                      <span style={{ fontSize: 10, fontWeight: 600, padding: '1px 6px', borderRadius: 4, background: '#fff', border: '1px solid #e2e8f0', color: '#475569' }}>{String(ex.discipline_code)}</span>
+                                    )}
+                                    {!!ex.area && (
+                                      <span style={{ fontSize: 10, fontWeight: 600, padding: '1px 6px', borderRadius: 4, background: '#fff', border: '1px solid #e2e8f0', color: '#475569' }}>{String(ex.area)}</span>
+                                    )}
+                                  </div>
+                                </div>
+                                {ex.age_days != null && (
+                                  <div style={{ flexShrink: 0, textAlign: 'center', minWidth: 46, padding: '4px 6px', borderRadius: 6, background: ac.ageBg }}>
+                                    <p style={{ fontSize: 18, fontWeight: 900, lineHeight: 1, color: ac.ageColor, margin: 0 }}>{String(ex.age_days)}</p>
+                                    <p style={{ fontSize: 9, color: '#94a3b8', marginTop: 1, lineHeight: 1.2, textTransform: 'uppercase' }}>days</p>
+                                  </div>
+                                )}
+                              </div>
+                            )
+                          })}
+                        </div>
+                      </div>
+                    )
+                  })}
+                </div>
+              </div>
+            )
+          })()}
+        </div>
+
+        {/* ── Additional Executive page widgets ────────────────────────────── */}
+        {wgt051 && <WidgetRenderer widget={wgt051} />}
+
+      </div>{/* /body */}
+    </div>
+  )
+}
+
+// ── Progress Analysis Page — 5-row custom layout ──────────────────────────────
+
+type ProgressPageProps = {
+  page: StructurePlanPage
+  pageIdx: number
+  pageWidgets: DashboardWidget[]
+}
+
+function ProgressAnalysisPage({ page, pageIdx, pageWidgets }: ProgressPageProps) {
+  const w = (id: string) => pageWidgets.find(x => x.widget_id === id)
+  const wgt008 = w('WGT-008')
+  const wgt009 = w('WGT-009')
+  const wgt010 = w('WGT-010')
+  const wgt011 = w('WGT-011')
+  const wgt012 = w('WGT-012')
+  const wgt013 = w('WGT-013')
+  const wgt014 = w('WGT-014')
+  const wgt044 = w('WGT-044')
+
+  // Extract annotation text from WGT-010 content
+  const wgt010Content = wgt010 ? getContent(wgt010.widget_ast ?? {}) : null
+  const unitsNote  = wgt010Content?.units_note  as string | undefined
+  const windowNote = wgt010Content?.window_note as string | undefined
+
+  // Extract management assessment text from WGT-011 content
+  const wgt011Content = wgt011 ? getContent(wgt011.widget_ast ?? {}) : null
+  const mgmtAssess    = wgt011Content?.management_assessment as Record<string, unknown> | undefined
+  const schedCtx      = wgt011Content?.schedule_context     as Record<string, unknown> | undefined
+
+  // ── shared style tokens — identical to ExecutiveOverviewPage ─────────────────
+  const CARD: React.CSSProperties = {
+    background: '#ffffff',
+    borderRadius: 16,
+    border: '1px solid #e2e8f0',
+    boxShadow: '0 1px 4px rgba(0,0,0,0.06)',
+    padding: '16px 18px',
+    display: 'flex',
+    flexDirection: 'column',
+  }
+
+  // Helper — renders a widget's chart content inside a sized card
+  const ChartCard = ({
+    widget,
+    height = 260,
+    style,
+    noteSlot,
+  }: {
+    widget: DashboardWidget | undefined
+    height?: number
+    style?: React.CSSProperties
+    noteSlot?: React.ReactNode
+  }) => {
+    if (!widget) return null
+    const ast  = widget.widget_ast ?? {}
+    const type = widget.widget_type
+    const inner = (() => {
+      switch (type) {
+        case 'line_chart':           return <LineChartWidget ast={ast} />
+        case 'bar_chart':
+        case 'grouped_bar_chart':    return <BarChartWidget ast={ast} />
+        case 'horizontal_bar_chart': return <BarChartWidget ast={ast} horizontal />
+        case 'area_chart':           return <AreaChartWidget ast={ast} />
+        case 'trade_schedule_gantt': return <TradeScheduleGanttWidget ast={ast} />
+        case 'photo_gallery':        return <PhotoGalleryWidget ast={ast} />
+        default:                     return <SmartFallback ast={ast} type={type} />
+      }
+    })()
+    return (
+      <div style={{ ...CARD, ...style }}>
+        <CardHeader title={widget.widget_title ?? ''} widgetId={widget.widget_id} />
+        <div style={{ flex: 1, height, minHeight: height }}>{inner}</div>
+        {noteSlot}
+      </div>
+    )
+  }
+
+  // Helper — renders a data table widget
+  const TableCard = ({
+    widget,
+    style,
+    headerSlot,
+  }: {
+    widget: DashboardWidget | undefined
+    style?: React.CSSProperties
+    headerSlot?: React.ReactNode
+  }) => {
+    if (!widget) return null
+    const ast = widget.widget_ast ?? {}
+    return (
+      <div style={{ ...CARD, ...style }}>
+        <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start', marginBottom: 10, gap: 12, flexShrink: 0 }}>
+          <CardHeader title={widget.widget_title ?? ''} widgetId={widget.widget_id} marginBottom={0} />
+          {headerSlot}
+        </div>
+        <div style={{ flex: 1 }}>
+          <DataTableWidget ast={ast} />
+        </div>
+      </div>
+    )
+  }
+
+  return (
+    <div style={{ fontFamily: '-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif', color: '#1e293b', background: '#f1f5f9', minHeight: '100%' }}>
+
+      {/* ── Page title block — matches Executive Overview style ──────────────── */}
+      <div style={{ background: '#fff', border: '1px solid #e2e8f0', borderRadius: 16, padding: '18px 24px 16px', marginBottom: 4 }}>
+        <div style={{ display: 'flex', alignItems: 'flex-start', justifyContent: 'space-between' }}>
+          <div>
+            <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 4 }}>
+              <div style={{ width: 4, height: 24, borderRadius: 2, background: 'linear-gradient(180deg, #1e40af, #3b82f6)', flexShrink: 0 }} />
+              <h2 style={{ fontSize: 22, fontWeight: 800, color: '#0f172a', margin: 0, letterSpacing: '-0.02em' }}>{page.title}</h2>
+            </div>
+            {page.subtitle ? (
+              <p style={{ fontSize: 13, color: '#64748b', margin: '0 0 0 12px', fontStyle: 'italic' }}>{page.subtitle}</p>
+            ) : (
+              <p style={{ fontSize: 13, color: '#64748b', margin: '0 0 0 12px', fontStyle: 'italic' }}>
+                Progress tracking, recovery planning and trade-level analysis.
+              </p>
+            )}
+          </div>
+          <div style={{ textAlign: 'right', flexShrink: 0 }}>
+            <p style={{ fontSize: 11, color: '#94a3b8', margin: '0 0 2px' }}>Page</p>
+            <p style={{ fontSize: 13, fontWeight: 700, color: '#1e293b', margin: 0 }}>{pageIdx + 1}</p>
+          </div>
+        </div>
+      </div>
+
+      {/* ── Body ─────────────────────────────────────────────────────────────── */}
+      <div style={{ padding: '20px 24px', display: 'flex', flexDirection: 'column', gap: 16 }}>
+
+      {/* ── ROW 1: Cumulative progress chart (full-width) ───────────────────── */}
+      <ChartCard widget={wgt008} height={280} />
+
+      {/* ── ROW 2: Weekly progress (left) + Weekly variance (right) ────────── */}
+      <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 14 }}>
+
+        {/* Weekly planned vs actual */}
+        <ChartCard widget={wgt009} height={240} />
+
+        {/* Weekly variance + explanatory text below */}
+        <ChartCard
+          widget={wgt010}
+          height={200}
+          noteSlot={
+            (unitsNote || windowNote) ? (
+              <div style={{ borderTop: '1px solid #f1f5f9', marginTop: 12, paddingTop: 10, display: 'flex', flexDirection: 'column', gap: 6 }}>
+                {windowNote && (
+                  <p style={{ fontSize: 12, color: '#64748b', lineHeight: 1.55, margin: 0 }}>{windowNote}</p>
+                )}
+                {unitsNote && (
+                  <p style={{ fontSize: 11, color: '#94a3b8', lineHeight: 1.5, margin: 0, fontStyle: 'italic' }}>{unitsNote}</p>
+                )}
+              </div>
+            ) : undefined
+          }
+        />
+      </div>
+
+      {/* ── ROW 3: Delay Recovery Scenario Planner (full-width) ─────────────── */}
+      <TableCard
+        widget={wgt011}
+        headerSlot={
+          !!mgmtAssess ? (
+            <div style={{ display: 'flex', gap: 12, flexWrap: 'wrap', alignItems: 'flex-start' }}>
+              {/* Schedule context pills */}
+              {!!schedCtx && (
+                <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap' }}>
+                  {schedCtx.reported_schedule_delay_days != null && (
+                    <span style={{ fontSize: 11, fontWeight: 700, padding: '3px 9px', borderRadius: 99, background: '#fff7ed', border: '1px solid #fed7aa', color: '#c2410c' }}>
+                      {String(schedCtx.reported_schedule_delay_days)} days delay
+                    </span>
+                  )}
+                  {!!schedCtx.forecast_completion_date && (
+                    <span style={{ fontSize: 11, fontWeight: 600, padding: '3px 9px', borderRadius: 99, background: '#f8fafc', border: '1px solid #e2e8f0', color: '#475569' }}>
+                      FCT: {String(schedCtx.forecast_completion_date)}
+                    </span>
+                  )}
+                </div>
+              )}
+              {/* Management assessment badge */}
+              {!!mgmtAssess.overall_status && (
+                <span style={{
+                  fontSize: 11, fontWeight: 700, padding: '3px 9px', borderRadius: 99,
+                  background: String(mgmtAssess.overall_status).includes('feasible') ? '#f0fdf4' : '#fff7ed',
+                  border: `1px solid ${String(mgmtAssess.overall_status).includes('feasible') ? '#bbf7d0' : '#fed7aa'}`,
+                  color: String(mgmtAssess.overall_status).includes('feasible') ? '#15803d' : '#c2410c',
+                }}>
+                  {String(mgmtAssess.overall_status).replace(/_/g, ' ')}
+                </span>
+              )}
+            </div>
+          ) : undefined
+        }
+      />
+
+      {/* Management assessment text block */}
+      {!!mgmtAssess && (!!mgmtAssess.headline || !!mgmtAssess.summary || !!mgmtAssess.recommended_action) && (
+        <div style={{
+          background: '#f8fafc', borderRadius: 8, border: '1px solid #e2e8f0',
+          padding: '12px 16px', display: 'flex', flexDirection: 'column', gap: 6,
+        }}>
+          {!!mgmtAssess.headline && (
+            <p style={{ fontSize: 13, fontWeight: 700, color: '#1e293b', margin: 0 }}>{String(mgmtAssess.headline)}</p>
+          )}
+          {!!mgmtAssess.summary && (
+            <p style={{ fontSize: 12, color: '#64748b', lineHeight: 1.55, margin: 0 }}>{String(mgmtAssess.summary)}</p>
+          )}
+          {!!mgmtAssess.recommended_action && (
+            <div style={{ display: 'flex', alignItems: 'flex-start', gap: 8, marginTop: 2 }}>
+              <span style={{ fontSize: 10, fontWeight: 700, padding: '2px 7px', borderRadius: 4, background: '#eff6ff', color: '#1d4ed8', border: '1px solid #bfdbfe', flexShrink: 0, marginTop: 1 }}>ACTION</span>
+              <p style={{ fontSize: 12, color: '#475569', lineHeight: 1.55, margin: 0 }}>{String(mgmtAssess.recommended_action)}</p>
+            </div>
+          )}
+        </div>
+      )}
+
+      {/* ── ROW 4: Recovery scenario comparison (left) + Progress by phase (right) */}
+      <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 14 }}>
+        <ChartCard widget={wgt012} height={260} />
+        <ChartCard widget={wgt013} height={260} />
+      </div>
+
+      {/* ── ROW 5: Construction progress by trade (full-width) ─────────────── */}
+      <ChartCard widget={wgt014} height={300} />
+
+      {/* ── Additional Progress page widgets ─────────────────────────────── */}
+      {wgt044 && <ChartCard widget={wgt044} height={280} />}
+
+      </div>{/* /body */}
+    </div>
+  )
+}
+
+// ── Schedule Intelligence Page — 5-row custom layout ──────────────────────────
+
+type SchedulePageProps = {
+  page: StructurePlanPage
+  pageIdx: number
+  pageWidgets: DashboardWidget[]
+}
+
+function ScheduleIntelligencePage({ page, pageIdx, pageWidgets }: SchedulePageProps) {
+  const w = (id: string) => pageWidgets.find(x => x.widget_id === id)
+  const wgt015 = w('WGT-015')   // Forecast Completion and Project Delay   — kpi_group
+  const wgt016 = w('WGT-016')   // Critical and Longest-Path Summary       — kpi_group
+  const wgt017 = w('WGT-017')   // Driving Activities                      — data_table
+  const wgt018 = w('WGT-018')   // Key Milestones — Planned vs Forecast    — milestone_table
+  const wgt020 = w('WGT-020')   // Two-Week Lookahead                      — lookahead_table
+
+  // ── shared style tokens — identical to ExecutiveOverviewPage ──────────────
+  const CARD: React.CSSProperties = {
+    background: '#ffffff',
+    borderRadius: 16,
+    border: '1px solid #e2e8f0',
+    boxShadow: '0 1px 4px rgba(0,0,0,0.06)',
+    padding: '16px 18px',
+    display: 'flex',
+    flexDirection: 'column',
+  }
+
+  // Helper — renders a kpi_group widget inside a card
+  const KpiCard = ({
+    widget,
+    style,
+  }: {
+    widget: DashboardWidget | undefined
+    style?: React.CSSProperties
+  }) => {
+    if (!widget) return null
+    const ast = widget.widget_ast ?? {}
+    return (
+      <div style={{ ...CARD, ...style }}>
+        <CardHeader title={widget.widget_title ?? ''} widgetId={widget.widget_id} />
+        <div style={{ flex: 1 }}>
+          <KpiGroupWidget ast={ast} />
+        </div>
+      </div>
+    )
+  }
+
+  // Helper — renders a table widget (data_table / milestone_table / lookahead_table)
+  const TableCard = ({
+    widget,
+    style,
+    summarySlot,
+  }: {
+    widget: DashboardWidget | undefined
+    style?: React.CSSProperties
+    summarySlot?: React.ReactNode
+  }) => {
+    if (!widget) return null
+    const ast  = widget.widget_ast ?? {}
+    const type = widget.widget_type
+    const inner = (() => {
+      switch (type) {
+        case 'data_table':                 return <DataTableWidget ast={ast} />
+        case 'milestone_table':
+        case 'lookahead_table':            return <MilestoneTableWidget ast={ast} />
+        default:                           return <DataTableWidget ast={ast} />
+      }
+    })()
+    return (
+      <div style={{ ...CARD, ...style }}>
+        <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start', marginBottom: 10, gap: 12, flexShrink: 0 }}>
+          <CardHeader title={widget.widget_title ?? ''} widgetId={widget.widget_id} marginBottom={0} />
+          {summarySlot}
+        </div>
+        <div style={{ flex: 1 }}>{inner}</div>
+      </div>
+    )
+  }
+
+  // Extract lookahead summary counts from WGT-020 content
+  const lookaheadContent = wgt020 ? getContent(wgt020.widget_ast ?? {}) : null
+  const lookaheadSummary = lookaheadContent?.summary as Record<string, unknown> | undefined
+
+  return (
+    <div style={{ fontFamily: '-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif', color: '#1e293b', background: '#f1f5f9', minHeight: '100%' }}>
+
+      {/* ── Page title block — matches Executive Overview style ──────────────── */}
+      <div style={{ background: '#fff', border: '1px solid #e2e8f0', borderRadius: 16, padding: '18px 24px 16px', marginBottom: 4 }}>
+        <div style={{ display: 'flex', alignItems: 'flex-start', justifyContent: 'space-between' }}>
+          <div>
+            <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 4 }}>
+              <div style={{ width: 4, height: 24, borderRadius: 2, background: 'linear-gradient(180deg, #1e40af, #3b82f6)', flexShrink: 0 }} />
+              <h2 style={{ fontSize: 22, fontWeight: 800, color: '#0f172a', margin: 0, letterSpacing: '-0.02em' }}>{page.title}</h2>
+            </div>
+            {page.subtitle ? (
+              <p style={{ fontSize: 13, color: '#64748b', margin: '0 0 0 12px', fontStyle: 'italic' }}>{page.subtitle}</p>
+            ) : (
+              <p style={{ fontSize: 13, color: '#64748b', margin: '0 0 0 12px', fontStyle: 'italic' }}>
+                Critical path, milestones, driving activities and two-week lookahead.
+              </p>
+            )}
+          </div>
+          <div style={{ textAlign: 'right', flexShrink: 0 }}>
+            <p style={{ fontSize: 11, color: '#94a3b8', margin: '0 0 2px' }}>Page</p>
+            <p style={{ fontSize: 13, fontWeight: 700, color: '#1e293b', margin: 0 }}>{pageIdx + 1}</p>
+          </div>
+        </div>
+      </div>
+
+      {/* ── Body ─────────────────────────────────────────────────────────────── */}
+      <div style={{ padding: '20px 24px', display: 'flex', flexDirection: 'column', gap: 16 }}>
+
+        {/* ── ROW 1: Forecast Completion (left) + Critical Path Summary (right) */}
+        <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 16 }}>
+          <KpiCard widget={wgt015} />
+          <KpiCard widget={wgt016} />
+        </div>
+
+        {/* ── ROW 2: Driving Activities table (full-width) ──────────────────── */}
+        <TableCard widget={wgt017} />
+
+        {/* ── ROW 3: Key Milestones — Planned vs Forecast (full-width) ─────── */}
+        <TableCard widget={wgt018} />
+
+        {/* ── ROW 4: Schedule Exceptions — rendered only when widget present ── */}
+        {pageWidgets
+          .filter(pw => pw.widget_id != null && !['WGT-015','WGT-016','WGT-017','WGT-018','WGT-020'].includes(pw.widget_id))
+          .map(pw => {
+            const ast  = pw.widget_ast ?? {}
+            const type = pw.widget_type
+            const inner = (() => {
+              switch (type) {
+                case 'alert_panel':     return <AlertPanelWidget ast={ast} />
+                case 'exception_table': return <ExceptionTableWidget ast={ast} />
+                case 'data_table':      return <DataTableWidget ast={ast} />
+                default:                return <SmartFallback ast={ast} type={type} />
+              }
+            })()
+            return (
+              <div key={pw.widget_record_id} style={{ ...CARD }}>
+                <CardHeader title={pw.widget_title ?? ''} widgetId={pw.widget_id} />
+                <div style={{ flex: 1 }}>{inner}</div>
+              </div>
+            )
+          })}
+
+        {/* ── ROW 5: Two-Week Lookahead (full-width) ────────────────────────── */}
+        <TableCard
+          widget={wgt020}
+          summarySlot={
+            !!lookaheadSummary && (
+              <div style={{ display: 'flex', gap: 10, flexShrink: 0, flexWrap: 'wrap', justifyContent: 'flex-end' }}>
+                {[
+                  { label: 'Activities',   value: lookaheadSummary.total_activities },
+                  { label: 'Starting',     value: lookaheadSummary.starting },
+                  { label: 'Critical',     value: lookaheadSummary.critical },
+                  { label: 'Longest Path', value: lookaheadSummary.longest_path },
+                  { label: 'Milestones',   value: lookaheadSummary.milestones },
+                ].filter(s => s.value != null).map((s, i) => (
+                  <div key={i} style={{ textAlign: 'center', minWidth: 52 }}>
+                    <p style={{ fontSize: 15, fontWeight: 700, color: '#1e293b', margin: 0 }}>{String(s.value)}</p>
+                    <p style={{ fontSize: 10, color: '#94a3b8', margin: '2px 0 0', textTransform: 'uppercase', letterSpacing: '0.06em' }}>{s.label}</p>
+                  </div>
+                ))}
+              </div>
+            )
+          }
+        />
+
+      </div>{/* /body */}
+    </div>
+  )
+}
+
+// ── Engineering, QA/QC and HSE Page — 7-row custom layout ─────────────────────
+
+type EngineeringPageProps = {
+  page: StructurePlanPage
+  pageIdx: number
+  pageWidgets: DashboardWidget[]
+}
+
+function EngineeringQAPage({ page, pageIdx, pageWidgets }: EngineeringPageProps) {
+  const w = (id: string) => pageWidgets.find(x => x.widget_id === id)
+  const wgt021 = w('WGT-021')   // Engineering Submission Summary           — kpi_group
+  const wgt022 = w('WGT-022')   // Eng Status Distribution — DWG            — donut_chart
+  const wgt023 = w('WGT-023')   // Eng Status Distribution — MAT            — donut_chart
+  const wgt024 = w('WGT-024')   // Eng Status Distribution — PRQ            — donut_chart
+  const wgt025 = w('WGT-025')   // Eng Status Counts by Type & Discipline   — hierarchical_table
+  const wgt026 = w('WGT-026')   // Eng Submissions — Last 4 Weeks           — line_chart
+  const wgt027 = w('WGT-027')   // QA/QC Status Counts by Discipline & Type — stacked_bar_chart
+  const wgt028 = w('WGT-028')   // QA/QC Document Status Summary            — kpi_group
+  const wgt029 = w('WGT-029')   // Material Submission Exceptions            — exception_table
+  const wgt030 = w('WGT-030')   // QA/QC Open Exceptions                    — exception_table
+  const wgt045 = w('WGT-045')   // Additional — Engineering/HSE page
+  const wgt046 = w('WGT-046')
+  const wgt047 = w('WGT-047')
+  const wgt048 = w('WGT-048')
+  const wgt049 = w('WGT-049')
+  const wgt050 = w('WGT-050')
+
+  // ── shared style tokens — identical to ExecutiveOverviewPage ──────────────
+  const CARD: React.CSSProperties = {
+    background: '#ffffff',
+    borderRadius: 16,
+    border: '1px solid #e2e8f0',
+    boxShadow: '0 1px 4px rgba(0,0,0,0.06)',
+    padding: '16px 18px',
+    display: 'flex',
+    flexDirection: 'column',
+  }
+
+  // Helper — generic card wrapper that dispatches to the right widget renderer
+  const WidgetCard = ({
+    widget,
+    style,
+    height,
+  }: {
+    widget: DashboardWidget | undefined
+    style?: React.CSSProperties
+    height?: number
+  }) => {
+    if (!widget) return null
+    const ast  = widget.widget_ast ?? {}
+    const type = widget.widget_type
+    const inner = (() => {
+      switch (type) {
+        case 'kpi_group':          return <KpiGroupWidget ast={ast} />
+        case 'donut_chart':
+        case 'pie_chart':          return <DonutChartWidget ast={ast} />
+        case 'line_chart':         return <LineChartWidget ast={ast} />
+        case 'bar_chart':
+        case 'grouped_bar_chart':  return <BarChartWidget ast={ast} />
+        case 'stacked_bar_chart':  return <BarChartWidget ast={ast} stacked />
+        case 'hierarchical_table': return <HierarchicalTableWidget ast={ast} />
+        case 'data_table':         return <DataTableWidget ast={ast} />
+        case 'exception_table':    return <ExceptionTableWidget ast={ast} />
+        default:                   return <SmartFallback ast={ast} type={type} />
+      }
+    })()
+    const needsHeight = ['donut_chart','pie_chart','line_chart','bar_chart','grouped_bar_chart','stacked_bar_chart'].includes(type ?? '')
+    return (
+      <div style={{ ...CARD, ...style }}>
+        <CardHeader title={widget.widget_title ?? ''} widgetId={widget.widget_id} />
+        <div style={{ flex: 1, ...(needsHeight && height ? { minHeight: height } : {}) }}>
+          {inner}
+        </div>
+      </div>
+    )
+  }
+
+  // Helper — table card with optional row-count badge in header
+  const TableCard = ({
+    widget,
+    style,
+  }: {
+    widget: DashboardWidget | undefined
+    style?: React.CSSProperties
+  }) => {
+    if (!widget) return null
+    const ast  = widget.widget_ast ?? {}
+    const type = widget.widget_type
+    const inner = (() => {
+      switch (type) {
+        case 'hierarchical_table': return <HierarchicalTableWidget ast={ast} />
+        case 'exception_table':    return <ExceptionTableWidget ast={ast} />
+        case 'data_table':         return <DataTableWidget ast={ast} />
+        default:                   return <AutoTable rows={(getContent(ast).rows ?? []) as Record<string, unknown>[]} />
+      }
+    })()
+    // Extract row count from content for badge
+    const cnt = getContent(ast)
+    const rowCount = (cnt.total_exception_rows ?? cnt.row_count ?? (cnt.rows as unknown[] | null)?.length) as number | undefined
+    return (
+      <div style={{ ...CARD, ...style }}>
+        <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 10, flexShrink: 0, gap: 12 }}>
+          <CardHeader title={widget.widget_title ?? ''} widgetId={widget.widget_id} marginBottom={0} />
+          {rowCount != null && (
+            <span style={{ fontSize: 11, fontWeight: 700, background: '#f1f5f9', color: '#64748b', borderRadius: 4, padding: '2px 8px', border: '1px solid #e2e8f0', flexShrink: 0 }}>
+              {rowCount} {rowCount === 1 ? 'row' : 'rows'}
+            </span>
+          )}
+        </div>
+        <div style={{ flex: 1 }}>{inner}</div>
+      </div>
+    )
+  }
+
+  return (
+    <div style={{ fontFamily: '-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif', color: '#1e293b', background: '#f1f5f9', minHeight: '100%' }}>
+
+      {/* ── Page title block — matches Executive Overview style ──────────────── */}
+      <div style={{ background: '#fff', border: '1px solid #e2e8f0', borderRadius: 16, padding: '18px 24px 16px', marginBottom: 4 }}>
+        <div style={{ display: 'flex', alignItems: 'flex-start', justifyContent: 'space-between' }}>
+          <div>
+            <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 4 }}>
+              <div style={{ width: 4, height: 24, borderRadius: 2, background: 'linear-gradient(180deg, #1e40af, #3b82f6)', flexShrink: 0 }} />
+              <h2 style={{ fontSize: 22, fontWeight: 800, color: '#0f172a', margin: 0, letterSpacing: '-0.02em' }}>{page.title}</h2>
+            </div>
+            {page.subtitle ? (
+              <p style={{ fontSize: 13, color: '#64748b', margin: '0 0 0 12px', fontStyle: 'italic' }}>{page.subtitle}</p>
+            ) : (
+              <p style={{ fontSize: 13, color: '#64748b', margin: '0 0 0 12px', fontStyle: 'italic' }}>
+                Transmittal status, QA/QC document tracking and exception management.
+              </p>
+            )}
+          </div>
+          <div style={{ textAlign: 'right', flexShrink: 0 }}>
+            <p style={{ fontSize: 11, color: '#94a3b8', margin: '0 0 2px' }}>Page</p>
+            <p style={{ fontSize: 13, fontWeight: 700, color: '#1e293b', margin: 0 }}>{pageIdx + 1}</p>
+          </div>
+        </div>
+      </div>
+
+      {/* ── Body ─────────────────────────────────────────────────────────────── */}
+      <div style={{ padding: '20px 24px', display: 'flex', flexDirection: 'column', gap: 16 }}>
+
+        {/* ── ROW 1: Submission Summary (left) + DWG donut (right) ─────────── */}
+        <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 16 }}>
+          <WidgetCard widget={wgt021} />
+          <WidgetCard widget={wgt022} height={220} />
+        </div>
+
+        {/* ── ROW 2: MAT donut (left) + PRQ donut (right) ──────────────────── */}
+        <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 16 }}>
+          <WidgetCard widget={wgt023} height={220} />
+          <WidgetCard widget={wgt024} height={220} />
+        </div>
+
+        {/* ── ROW 3: Eng Status Counts by Type & Discipline (full-width) ───── */}
+        <TableCard widget={wgt025} />
+
+        {/* ── ROW 4: Last 4-week submissions trend (left) + QA/QC stacked bar (right) */}
+        <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 16 }}>
+          <WidgetCard widget={wgt026} height={240} />
+          <WidgetCard widget={wgt027} height={240} />
+        </div>
+
+        {/* ── ROW 5: QA/QC Document Status Summary (left half) ─────────────── */}
+        <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 16 }}>
+          <WidgetCard widget={wgt028} />
+          {/* Right slot intentionally empty — balance the grid */}
+          <div />
+        </div>
+
+        {/* ── ROW 6: Material Submission Exceptions (full-width) ────────────── */}
+        <TableCard widget={wgt029} />
+
+        {/* ── ROW 7: QA/QC Open Exceptions (full-width) ────────────────────── */}
+        <TableCard widget={wgt030} />
+
+        {/* ── Remaining Engineering/QA widgets not in fixed layout ─────────── */}
+        {([wgt045, wgt046, wgt047, wgt048, wgt049, wgt050] as (DashboardWidget | undefined)[]).filter((x): x is DashboardWidget => !!x).map(wgt => (
+          <WidgetCard key={wgt.widget_record_id} widget={wgt} />
+        ))}
+
+      </div>{/* /body */}
+    </div>
+  )
+}
+
+// ── Resources and Manpower Page — 4-row custom layout ─────────────────────────
+
+type ResourcesPageProps = {
+  page: StructurePlanPage
+  pageIdx: number
+  pageWidgets: DashboardWidget[]
+}
+
+function ResourcesManpowerPage({ page, pageIdx, pageWidgets }: ResourcesPageProps) {
+  const w = (id: string) => pageWidgets.find(x => x.widget_id === id)
+  const wgt031 = w('WGT-031')   // Current Manpower Summary                       — kpi_group
+  const wgt032 = w('WGT-032')   // Weekly Manpower Trend — Planned vs Actual       — line_chart
+  const wgt033 = w('WGT-033')   // Current Planned vs Actual Manpower by Resource  — grouped_bar_chart
+  const wgt034 = w('WGT-034')   // Resource Manpower and Manhour Breakdown         — resource_table
+  const wgt035 = w('WGT-035')   // Manhour Summary — Planned vs Estimated Actual   — kpi_group
+  const wgt036 = w('WGT-036')   // Weekly Manhour Trend — Planned vs Est. Actual   — line_chart
+
+  // Extract notes from WGT-035 for display beneath its KPI cards
+  const wgt035Notes = (getContent(wgt035?.widget_ast ?? {}).notes) as string[] | undefined
+
+  // ── shared style tokens ────────────────────────────────────────────────────
+  const CARD: React.CSSProperties = {
+    background: '#ffffff',
+    borderRadius: 16,
+    border: '1px solid #e2e8f0',
+    boxShadow: '0 1px 4px rgba(0,0,0,0.06)',
+    padding: '16px 18px',
+    display: 'flex',
+    flexDirection: 'column',
+  }
+
+  // Helper — renders any widget into a styled card with title
+  const WidgetCard = ({
+    widget,
+    style,
+    height,
+    footerSlot,
+  }: {
+    widget: DashboardWidget | undefined
+    style?: React.CSSProperties
+    height?: number
+    footerSlot?: React.ReactNode
+  }) => {
+    if (!widget) return null
+    const ast  = widget.widget_ast ?? {}
+    const type = widget.widget_type
+    const inner = (() => {
+      switch (type) {
+        case 'kpi_group':          return <KpiGroupWidget ast={ast} />
+        case 'line_chart':         return <LineChartWidget ast={ast} />
+        case 'bar_chart':
+        case 'grouped_bar_chart':  return <BarChartWidget ast={ast} />
+        case 'stacked_bar_chart':  return <BarChartWidget ast={ast} stacked />
+        case 'resource_table':     return <ResourceTableWidget ast={ast} />
+        case 'data_table':         return <DataTableWidget ast={ast} />
+        default:                   return <SmartFallback ast={ast} type={type} />
+      }
+    })()
+    const needsHeight = ['line_chart','bar_chart','grouped_bar_chart','stacked_bar_chart'].includes(type ?? '')
+    return (
+      <div style={{ ...CARD, ...style }}>
+        <CardHeader title={widget.widget_title ?? ''} widgetId={widget.widget_id} />
+        <div style={{ flex: 1, ...(needsHeight && height ? { minHeight: height } : {}) }}>
+          {inner}
+        </div>
+        {footerSlot}
+      </div>
+    )
+  }
+
+  // Helper — table card (resource_table / data_table) with row-count badge
+  const TableCard = ({
+    widget,
+    style,
+  }: {
+    widget: DashboardWidget | undefined
+    style?: React.CSSProperties
+  }) => {
+    if (!widget) return null
+    const ast  = widget.widget_ast ?? {}
+    const type = widget.widget_type
+    const inner = (() => {
+      switch (type) {
+        case 'resource_table': return <ResourceTableWidget ast={ast} />
+        case 'data_table':     return <DataTableWidget ast={ast} />
+        default:               return <AutoTable rows={(getContent(ast).rows ?? []) as Record<string, unknown>[]} />
+      }
+    })()
+    const cnt = getContent(ast)
+    const rowCount = (cnt.row_count ?? (cnt.rows as unknown[] | null)?.length) as number | undefined
+    return (
+      <div style={{ ...CARD, ...style }}>
+        <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 10, flexShrink: 0, gap: 12 }}>
+          <CardHeader title={widget.widget_title ?? ''} widgetId={widget.widget_id} marginBottom={0} />
+          {rowCount != null && (
+            <span style={{ fontSize: 11, fontWeight: 700, background: '#f1f5f9', color: '#64748b', borderRadius: 4, padding: '2px 8px', border: '1px solid #e2e8f0', flexShrink: 0 }}>
+              {rowCount} {rowCount === 1 ? 'row' : 'rows'}
+            </span>
+          )}
+        </div>
+        <div style={{ flex: 1 }}>{inner}</div>
+      </div>
+    )
+  }
+
+  return (
+    <div style={{ fontFamily: '-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif', color: '#1e293b', background: '#f1f5f9', minHeight: '100%' }}>
+
+      {/* ── Page title block ─────────────────────────────────────────────────── */}
+      <div style={{ background: '#fff', border: '1px solid #e2e8f0', borderRadius: 16, padding: '18px 24px 16px', marginBottom: 4 }}>
+        <div style={{ display: 'flex', alignItems: 'flex-start', justifyContent: 'space-between' }}>
+          <div>
+            <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 4 }}>
+              <div style={{ width: 4, height: 24, borderRadius: 2, background: 'linear-gradient(180deg, #1e40af, #3b82f6)', flexShrink: 0 }} />
+              <h2 style={{ fontSize: 22, fontWeight: 800, color: '#0f172a', margin: 0, letterSpacing: '-0.02em' }}>{page.title}</h2>
+            </div>
+            {page.subtitle ? (
+              <p style={{ fontSize: 13, color: '#64748b', margin: '0 0 0 12px', fontStyle: 'italic' }}>{page.subtitle}</p>
+            ) : (
+              <p style={{ fontSize: 13, color: '#64748b', margin: '0 0 0 12px', fontStyle: 'italic' }}>
+                Workforce deployment, manpower trends and manhour performance.
+              </p>
+            )}
+          </div>
+          <div style={{ textAlign: 'right', flexShrink: 0 }}>
+            <p style={{ fontSize: 11, color: '#94a3b8', margin: '0 0 2px' }}>Page</p>
+            <p style={{ fontSize: 13, fontWeight: 700, color: '#1e293b', margin: 0 }}>{pageIdx + 1}</p>
+          </div>
+        </div>
+      </div>
+
+      {/* ── Body ─────────────────────────────────────────────────────────────── */}
+      <div style={{ padding: '20px 24px', display: 'flex', flexDirection: 'column', gap: 16 }}>
+
+        {/* ── ROW 1: Manpower Summary KPIs (left) + Weekly Trend chart (right) */}
+        <div style={{ display: 'grid', gridTemplateColumns: '1fr 1.4fr', gap: 16 }}>
+          <WidgetCard widget={wgt031} />
+          <WidgetCard widget={wgt032} height={260} />
+        </div>
+
+        {/* ── ROW 2: Planned vs Actual by Resource — grouped bar (full-width) */}
+        <WidgetCard widget={wgt033} height={260} />
+
+        {/* ── ROW 3: Resource Manpower & Manhour Breakdown table (full-width) */}
+        <TableCard widget={wgt034} />
+
+        {/* ── ROW 4: Manhour Summary KPIs (left) + Weekly Manhour Trend (right) */}
+        <div style={{ display: 'grid', gridTemplateColumns: '1fr 1.4fr', gap: 16 }}>
+          {/* Left: KPI card + notes footnote */}
+          <WidgetCard
+            widget={wgt035}
+            footerSlot={
+              !!wgt035Notes?.length && (
+                <div style={{ marginTop: 12, borderTop: '1px solid #f1f5f9', paddingTop: 10, display: 'flex', flexDirection: 'column', gap: 4 }}>
+                  {wgt035Notes.map((note, i) => (
+                    <p key={i} style={{ fontSize: 11, color: '#94a3b8', lineHeight: 1.5, margin: 0 }}>{note}</p>
+                  ))}
+                </div>
+              )
+            }
+          />
+          <WidgetCard widget={wgt036} height={260} />
+        </div>
+
+      </div>{/* /body */}
+    </div>
+  )
+}
+
+// ── KPI Performance Page — 5-row custom layout ────────────────────────────────
+
+type KpiPageProps = {
+  page: StructurePlanPage
+  pageIdx: number
+  pageWidgets: DashboardWidget[]
+}
+
+function KpiPerformancePage({ page, pageIdx, pageWidgets }: KpiPageProps) {
+  const w = (id: string) => pageWidgets.find(x => x.widget_id === id)
+  const wgt037 = w('WGT-037')   // KPI Coverage Summary                                   — kpi_group
+  const wgt038 = w('WGT-038')   // Total vs Actual KPI Quantities to Date                 — data_table
+  const wgt039 = w('WGT-039')   // Planned vs Actual KPI Quantities Cumulative to Date    — grouped_bar_chart
+  const wgt040 = w('WGT-040')   // Weekly Planned vs Actual KPI Quantities — Current Week — grouped_bar_chart
+  const wgt041 = w('WGT-041')   // KPI Current-Week and Cumulative Variances               — exception_table
+  const wgt045 = w('WGT-045')   // KPI summary / additional KPI group                      — kpi_group
+
+  // ── shared style tokens ────────────────────────────────────────────────────
+  const CARD: React.CSSProperties = {
+    background: '#ffffff',
+    borderRadius: 16,
+    border: '1px solid #e2e8f0',
+    boxShadow: '0 1px 4px rgba(0,0,0,0.06)',
+    padding: '16px 18px',
+    display: 'flex',
+    flexDirection: 'column',
+  }
+
+  // Helper — generic widget card
+  const WidgetCard = ({
+    widget,
+    style,
+    height,
+  }: {
+    widget: DashboardWidget | undefined
+    style?: React.CSSProperties
+    height?: number
+  }) => {
+    if (!widget) return null
+    const ast  = widget.widget_ast ?? {}
+    const type = widget.widget_type
+    const inner = (() => {
+      switch (type) {
+        case 'kpi_group':          return <KpiGroupWidget ast={ast} />
+        case 'line_chart':         return <LineChartWidget ast={ast} />
+        case 'bar_chart':
+        case 'grouped_bar_chart':  return <BarChartWidget ast={ast} multiKpi />
+        case 'stacked_bar_chart':  return <BarChartWidget ast={ast} stacked multiKpi />
+        case 'data_table':         return <DataTableWidget ast={ast} />
+        case 'exception_table':    return <ExceptionTableWidget ast={ast} />
+        default:                   return <SmartFallback ast={ast} type={type} />
+      }
+    })()
+    const needsHeight = ['line_chart','bar_chart','grouped_bar_chart','stacked_bar_chart'].includes(type ?? '')
+    return (
+      <div style={{ ...CARD, ...style }}>
+        <CardHeader title={widget.widget_title ?? ''} widgetId={widget.widget_id} />
+        <div style={{ flex: 1, ...(needsHeight && height ? { minHeight: height } : {}) }}>
+          {inner}
+        </div>
+      </div>
+    )
+  }
+
+  // Helper — table / exception card with row-count badge
+  const TableCard = ({
+    widget,
+    style,
+  }: {
+    widget: DashboardWidget | undefined
+    style?: React.CSSProperties
+  }) => {
+    if (!widget) return null
+    const ast  = widget.widget_ast ?? {}
+    const type = widget.widget_type
+    const inner = (() => {
+      switch (type) {
+        case 'data_table':      return <DataTableWidget ast={ast} />
+        case 'exception_table': return <ExceptionTableWidget ast={ast} />
+        default:                return <DataTableWidget ast={ast} />
+      }
+    })()
+    const cnt = getContent(ast)
+    const rowCount = (cnt.row_count ?? (cnt.rows as unknown[] | null)?.length) as number | undefined
+    return (
+      <div style={{ ...CARD, ...style }}>
+        <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 10, flexShrink: 0, gap: 12 }}>
+          <CardHeader title={widget.widget_title ?? ''} widgetId={widget.widget_id} marginBottom={0} />
+          {rowCount != null && (
+            <span style={{ fontSize: 11, fontWeight: 700, background: '#f1f5f9', color: '#64748b', borderRadius: 4, padding: '2px 8px', border: '1px solid #e2e8f0', flexShrink: 0 }}>
+              {rowCount} {rowCount === 1 ? 'row' : 'rows'}
+            </span>
+          )}
+        </div>
+        <div style={{ flex: 1 }}>{inner}</div>
+      </div>
+    )
+  }
+
+  return (
+    <div style={{ fontFamily: '-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif', color: '#1e293b', background: '#f1f5f9', minHeight: '100%' }}>
+
+      {/* ── Page title block ─────────────────────────────────────────────────── */}
+      <div style={{ background: '#fff', border: '1px solid #e2e8f0', borderRadius: 16, padding: '18px 24px 16px', marginBottom: 4 }}>
+        <div style={{ display: 'flex', alignItems: 'flex-start', justifyContent: 'space-between' }}>
+          <div>
+            <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 4 }}>
+              <div style={{ width: 4, height: 24, borderRadius: 2, background: 'linear-gradient(180deg, #1e40af, #3b82f6)', flexShrink: 0 }} />
+              <h2 style={{ fontSize: 22, fontWeight: 800, color: '#0f172a', margin: 0, letterSpacing: '-0.02em' }}>{page.title}</h2>
+            </div>
+            {page.subtitle ? (
+              <p style={{ fontSize: 13, color: '#64748b', margin: '0 0 0 12px', fontStyle: 'italic' }}>{page.subtitle}</p>
+            ) : (
+              <p style={{ fontSize: 13, color: '#64748b', margin: '0 0 0 12px', fontStyle: 'italic' }}>
+                Key performance indicator coverage, quantities and variance tracking.
+              </p>
+            )}
+          </div>
+          <div style={{ textAlign: 'right', flexShrink: 0 }}>
+            <p style={{ fontSize: 11, color: '#94a3b8', margin: '0 0 2px' }}>Page</p>
+            <p style={{ fontSize: 13, fontWeight: 700, color: '#1e293b', margin: 0 }}>{pageIdx + 1}</p>
+          </div>
+        </div>
+      </div>
+
+      {/* ── Body ─────────────────────────────────────────────────────────────── */}
+      <div style={{ padding: '20px 24px', display: 'flex', flexDirection: 'column', gap: 16 }}>
+
+        {/* ── ROW 1: KPI Coverage Summary — full-width KPI group ───────────── */}
+        <WidgetCard widget={wgt037} />
+
+        {/* ── ROW 2: Total vs Actual KPI Quantities to Date — full-width table */}
+        <TableCard widget={wgt038} />
+
+        {/* ── ROW 3: Planned vs Actual KPI Quantities Cumulative — full-width grouped bar chart */}
+        <WidgetCard widget={wgt039} height={280} />
+
+        {/* ── ROW 4: Weekly KPI bar chart: full width, matching WGT-039 ────── */}
+        <WidgetCard widget={wgt040} height={280} />
+
+        {/* ── ROW 5: KPI Variances exception table — full-width ─────────────── */}
+        <TableCard widget={wgt041} />
+
+        {/* ── ROW 6: Additional KPI group (WGT-045) — rendered only when present */}
+        {wgt045 && <WidgetCard widget={wgt045} />}
+
+      </div>{/* /body */}
+    </div>
+  )
+}
+
+// ── A3 Weekly Dashboard Page ──────────────────────────────────────────────────
+// Renders a print-optimised A3 single-page summary using only the widgets
+// flagged include_in_a3_export=true in the structure plan, laid out on a
+// 12-column grid matching the grid.column_span values from the plan.
+
+// A3 has a fixed physical canvas. Its widgets must fit their cells rather than
+// forcing the entire sheet (including every label) to shrink to screen heights.
+function A3Widget({ widget, region }: { widget: DashboardWidget; region?: A3Region }) {
+  const statusColor = useStatusColor()
+  const tok = useContext(DesignContext)
+  const printTypography = designObject(designObject(tok.spec.print_specification).typography)
+  const content = getContent(widget.widget_ast ?? {})
+  const nested = content.chart as Record<string, unknown> | undefined
+  const c = nested ? { ...content, ...nested } : content
+  const type = widget.widget_type ?? ''
+  const palette = useChartPalette()
+  const dataDate = useContext(DataDateContext)
+  // Match the screen charts: explicit source colour, then dashboard palette.
+  const seriesColor = (series: SeriesSpec, index: number) => series.color ?? palette[index % palette.length]
+  const allData = (c.data ?? []) as Record<string, unknown>[]
+  const weekly = type.includes('bar_chart') && /period|week/.test(String(c.category_field ?? ''))
+  const data = weekly ? allData.slice(-9) : allData
+  const xKey = String(c.category_field ?? c.x_key ?? c.x_axis ?? 'category')
+  const series = useNormalisedSeries(c, xKey)
+  const empty = (c.empty_state ?? {}) as { heading?: string; message?: string }
+  const noData = <div className="a3-empty"><strong>{empty.heading ?? 'No data available'}</strong>{empty.message && <span>{empty.message}</span>}</div>
+
+  if (type.includes('chart') && !['donut_chart', 'pie_chart'].includes(type)) {
+    if (!data.length) return noData
+    const isLine = type === 'line_chart' || type === 'area_chart'
+    const horizontal = type === 'horizontal_bar_chart'
+    const axisTick = { fontSize: designNumber(printTypography.chart_axis_label_pt, 6) * 96 / 72, fill: tok('chart_axis_label', '#64748b') }
+    const category = (value: unknown) => {
+      const text = String(value ?? '')
+      return /^\d{4}-\d{2}-\d{2}/.test(text) ? fmtDate(text) : text
+    }
+    const marker = findDataDateLabel(data, xKey, xKey, dataDate)
+    const dataDateMarker = marker != null ? <ReferenceLine
+      {...(horizontal ? { y: marker } : { x: marker })}
+      stroke="#ef4444" strokeWidth={1.5} strokeDasharray="4 3"
+      label={{ value: 'Data Date', position: 'insideTopRight', fontSize: 8, fill: '#ef4444', dy: 4, dx: -4 }}
+    /> : null
+    const axes = <>
+      <CartesianGrid stroke={tok('chart_gridline', '#e2e8f0')} vertical={false} />
+      <XAxis type={horizontal ? 'number' : 'category'} dataKey={horizontal ? undefined : xKey}
+        tick={axisTick} tickFormatter={horizontal ? fmtAxis : category} minTickGap={32} height={12} />
+      <YAxis type={horizontal ? 'category' : 'number'} dataKey={horizontal ? xKey : undefined}
+        tick={axisTick} tickFormatter={horizontal ? undefined : fmtAxis} width={horizontal ? 72 : 38} />
+      <Legend verticalAlign="top" height={16} iconSize={7} wrapperStyle={{ fontSize: designNumber(printTypography.chart_legend_pt, 6.75) * 96 / 72 }} />
+    </>
+    return <ResponsiveContainer width="100%" height="100%" minHeight={0}>
+      {isLine ? <LineChart data={data} margin={{ top: 2, right: 8, bottom: 0, left: 0 }}>
+        {axes}
+        {dataDateMarker}
+        {series.map((s, i) => <Line key={s.key} dataKey={s.key} name={s.label} stroke={seriesColor(s, i)} strokeWidth={1.7} dot={{ r: 1.3, strokeWidth: 0 }} connectNulls={false} isAnimationActive={false} />)}
+      </LineChart> : <BarChart data={data} layout={horizontal ? 'vertical' : 'horizontal'} margin={{ top: 2, right: 8, bottom: 0, left: 0 }}>
+        {axes}
+        {dataDateMarker}
+        {series.map((s, i) => <Bar key={s.key} dataKey={s.key} name={s.label} fill={seriesColor(s, i)} stackId={type === 'stacked_bar_chart' ? 'stack' : undefined} isAnimationActive={false} />)}
+      </BarChart>}
+    </ResponsiveContainer>
+  }
+
+  if (type === 'donut_chart' || type === 'pie_chart') {
+    const slices = (c.data ?? c.segments ?? c.slices ?? []) as Record<string, unknown>[]
+    if (!slices.length) return noData
+    const values = slices.map(slice => ({
+      name: String(slice.status_label ?? slice.label ?? slice.name ?? slice.status_code ?? slice.code ?? ''),
+      value: Number(slice.count ?? slice.value ?? 0),
+      color: statusColor(String(slice.status_code ?? slice.code ?? ''), slice.color as string | undefined),
+    }))
+    return <div className="a3-donut">
+      <div className="a3-donut-chart"><ResponsiveContainer width="100%" height="100%" minHeight={0}>
+        <PieChart><Pie data={values} dataKey="value" nameKey="name" cx="50%" cy="50%" innerRadius="52%" outerRadius="82%" isAnimationActive={false} strokeWidth={0}>
+          {values.map((slice, i) => <Cell key={i} fill={slice.color} />)}
+        </Pie><text x="50%" y="50%" textAnchor="middle" dominantBaseline="middle" fill="#102746" fontSize={16} fontWeight={700}>{fmtNum(values.reduce((sum, slice) => sum + slice.value, 0), 0)}</text></PieChart>
+      </ResponsiveContainer></div>
+      <div className="a3-donut-legend">{values.map((slice, i) => <div key={i}><i style={{ background: slice.color }} /><span>{slice.name}</span><strong>{fmtNum(slice.value, 0)}</strong></div>)}</div>
+    </div>
+  }
+
+  if (type === 'kpi_group' || type === 'kpi_card') {
+    const rawItems = (c.items ?? c.kpis ?? c.metrics ?? c.cards ?? [c]) as (KpiItem & Record<string, unknown>)[]
+    const cards: Record<string, unknown>[] = normaliseKpiItems(rawItems)
+    const previousActual = cards.find(card => /actual/i.test(String(card.key ?? card.label ?? '')) && card.comparison_value != null)
+    if (previousActual) cards.push({ label: 'Previous actual', value: previousActual.comparison_value, unit: previousActual.unit })
+    return <div className="a3-kpis" style={{ gridTemplateColumns: `repeat(${Math.max(1, cards.length)}, minmax(0, 1fr))` }}>
+      {cards.map((card, i) => <div key={String(card.key ?? i)} className="a3-kpi" style={{ background: '#f9fafb' }}>
+        <span>{String(card.label ?? card.title ?? '')}</span>
+        <strong style={{ color: '#111827' }}>
+          {card.value == null ? '—' : typeof card.value === 'number' ? fmtNum(card.value, Number.isInteger(card.value) ? 0 : 2) : String(card.value)}
+          {card.unit != null && <small> {String(card.unit)}</small>}
+        </strong>
+        {card.comparison_value != null && card !== previousActual && <small>Previous: {typeof card.comparison_value === 'number' ? fmtNum(card.comparison_value, 2) : String(card.comparison_value)}</small>}
+      </div>)}
+    </div>
+  }
+
+  if (type.includes('table')) {
+    const rows = (c.rows ?? c.activities ?? c.items ?? []) as Record<string, unknown>[]
+    if (!rows.length) return noData
+    const columns = toColSpecs((c.columns ?? Object.keys(rows[0])) as unknown[])
+    if (type === 'financial_status_table' && rows.length === 1) {
+      return <dl className="a3-record">{columns.map(col => <div key={col.key}><dt>{col.label}</dt><dd>{renderCellValue(rows[0][col.key])}</dd></div>)}</dl>
+    }
+    // A single-sheet overview explicitly summarises long registers. Full data
+    // remains in the normal dashboard; omitted rows are never silently hidden.
+    const summaryColumns = columns.slice(0, 3)
+    return <div className="a3-table-summary"><table><thead><tr>{summaryColumns.map(col => <th key={col.key}>{col.label}</th>)}</tr></thead>
+      <tbody>{rows.slice(0, 3).map((row, i) => <tr key={i}>{summaryColumns.map(col => <td key={col.key}><span title={renderCellValue(row[col.key])}>{renderCellValue(row[col.key])}</span></td>)}</tr>)}</tbody></table>
+      {(rows.length > 3 || columns.length > 3) && <p>Summary: {Math.min(3, rows.length)} of {rows.length} rows, {summaryColumns.length} of {columns.length} columns. Full register in dashboard.</p>}
+    </div>
+  }
+
+  if (type === 'trade_schedule_gantt') {
+    const trades = (c.trades ?? []) as Record<string, unknown>[]
+    if (!trades.length) return noData
+    const selectedCodes = region?.presentation_selection?.selected_trade_codes
+    const selected = selectedCodes?.length
+      ? selectedCodes.flatMap(code => trades.filter(trade => trade.trade_code === code)) : trades
+    const shown = selected.slice(0, region?.presentation_selection?.maximum_items ?? 8)
+    const date = (value: unknown) => typeof value === 'string' ? Date.parse(value) : NaN
+    const dates = trades.flatMap(trade => {
+      const planned = trade.planned as Record<string, unknown> | undefined
+      const actual = trade.actual as Record<string, unknown> | undefined
+      return [date(planned?.start), date(planned?.finish), date(actual?.start), date(actual?.finish)]
+    }).filter(Number.isFinite)
+    if (!dates.length) return <div className="a3-empty">Trade dates not available</div>
+    const start = Math.min(...dates)
+    const finish = Math.max(...dates)
+    const span = Math.max(1, finish - start)
+    const cutoff = date(dataDate)
+    const markerPosition = Number.isFinite(cutoff) && cutoff >= start && cutoff <= finish ? (cutoff - start) / span * 100 : null
+    return <div className="a3-trades">{shown.map((trade, i) => {
+      const planned = trade.planned as Record<string, unknown> | undefined
+      const actual = trade.actual as Record<string, unknown> | undefined
+      return <div key={i}><span>{String(trade.trade_name ?? trade.trade_label ?? trade.trade_code ?? '')}</span><div>
+        {[planned, actual].map((value, j) => {
+          const from = date(value?.start), to = date(value?.finish)
+          return <div key={j} className="a3-trade-track" style={{ position: 'relative' }}>{Number.isFinite(from) && Number.isFinite(to) && <div style={{ marginLeft: `${(from - start) / span * 100}%`, width: `${Math.max(0.5, (to - from) / span * 100)}%`, background: palette[j] }} />}{markerPosition != null && <span title={`Data Date: ${dataDate}`} style={{ position: 'absolute', left: `${markerPosition}%`, top: -2, bottom: -2, borderLeft: '1.5px dashed #ef4444' }} />}</div>
+        })}
+      </div></div>
+    })}<small>{new Date(start).toISOString().slice(0, 10)} — {new Date(finish).toISOString().slice(0, 10)} · Planned / actual dates{markerPosition != null && <span style={{ color: '#ef4444' }}> · Data Date: {dataDate}</span>}</small>
+    <small>{shown.length} of {trades.length} trades. In-progress actual finish is latest recorded activity finish.</small></div>
+  }
+
+  if (type === 'photo_gallery') {
+    const photos = (c.photos ?? []) as Record<string, unknown>[]
+    if (!photos.length) return noData
+    const photo = photos[0]
+    const url = String(photo.photo_url ?? photo.imageurl ?? '')
+    return <div className="a3-photo"><img src={url} alt={String(photo.caption_or_description ?? photo.filename ?? 'Progress photograph')} /><div><strong>{String(photo.photo_date_display ?? photo.photo_date ?? '')}</strong><p>{String(photo.caption_or_description ?? photo.filename ?? '')}</p><small>Photo 1 of {photos.length}</small></div></div>
+  }
+
+  // Preserve existing renderers for other supported widget types.
+  return <WidgetInner widget={widget} />
+}
+
+type A3PageProps = {
+  structure: DashboardStructure
+  widgets: DashboardWidget[]
+}
+
+function A3PrintDashboardPage({ structure, widgets }: A3PageProps) {
+  const tok = useContext(DesignContext)
+  const isPrinting = usePrintMode()
+
+  const a3 = structure.a3_layout
+  const ctx = a3?.dashboard_context
+  const footerCfg = a3?.footer
+
+  // Read regions from a3_layout, skip header/footer metadata regions (no widget_ids)
+  const nonWidgetIds = new Set(a3?.planning_metadata?.non_widget_region_ids ?? [])
+  const regions: A3Region[] = [...(a3?.layout?.regions ?? [])]
+    .sort((a, b) => (a.region_order ?? 0) - (b.region_order ?? 0))
+    .filter(r => !nonWidgetIds.has(r.region_id) && r.widget_ids.length > 0)
+
+  // Map widget_id → DashboardWidget (fetched row)
+  const widgetById = useMemo(() => {
+    const m: Record<string, DashboardWidget> = {}
+    for (const w of widgets) { if (w.widget_id) m[w.widget_id] = w }
+    return m
+  }, [widgets])
+
+  // Keep the screen as lightweight as before: mount compact charts only for
+  // the print lifecycle. The stable shell lets preparePrint flush their mount.
+  if (!isPrinting) return <CompactContext.Provider value={true}><div className="a3-page a3-print-sheet" style={{ height: '297mm' }} /></CompactContext.Provider>
+
+  const dataDate = ctx?.data_date ?? structure.data_date ?? ''
+  const weekNum  = ctx?.week_num  ?? structure.week_num  ?? ''
+  const title    = ctx?.dashboard_title ?? structure.dashboard_title ?? 'Weekly Project Dashboard'
+  const reportType = ctx?.report_type ?? 'Weekly Progress Report'
+
+  const layoutRows: { weight: number; used: number }[] = []
+  const placements = regions.map(region => {
+    const columns = Math.max(1, Math.min(12, region.column_span || 4))
+    const explicitRow = region.global_grid_row != null ? region.global_grid_row - 2
+      : region.grid_row != null && region.band ? region.grid_row - 1 + (region.band === 'main' ? 1 : region.band === 'bottom' ? 4 : 0) : null
+    if (explicitRow != null && explicitRow >= 0) {
+      while (layoutRows.length <= explicitRow) layoutRows.push({ weight: 0, used: 0 })
+      layoutRows[explicitRow].weight = Math.max(layoutRows[explicitRow].weight, region.height_mm ?? 42)
+      layoutRows[explicitRow].used += columns
+      return explicitRow + 1
+    }
+    let row = layoutRows.length - 1
+    if (row < 0 || layoutRows[row].used + columns > 12) {
+      layoutRows.push({ weight: 0, used: 0 })
+      row++
+    }
+    layoutRows[row].used += columns
+    layoutRows[row].weight = Math.max(layoutRows[row].weight, region.height_mm ?? ((region.row_span || 2) <= 2 ? 30 : 42))
+    return row + 1
+  })
+
+  // Column span → Tailwind grid-cols-12 span class
+  const spanClass = (span: number | undefined): string => {
+    switch (span) {
+      case 1:  return 'col-span-1'
+      case 2:  return 'col-span-2'
+      case 3:  return 'col-span-3'
+      case 4:  return 'col-span-4'
+      case 5:  return 'col-span-5'
+      case 6:  return 'col-span-6'
+      case 7:  return 'col-span-7'
+      case 8:  return 'col-span-8'
+      case 9:  return 'col-span-9'
+      case 10: return 'col-span-10'
+      case 11: return 'col-span-11'
+      case 12: return 'col-span-12'
+      default: return 'col-span-4'
+    }
+  }
+
+  return (
+    <CompactContext.Provider value={true}>
+      {/*
+        No CSS transform — the browser already sets the print viewport to the
+        injected @page size (420mm × 297mm A3 landscape).  We just need the
+        content to flow inside 100% of that width at compact heights.
+        On screen this renders as a normal scrollable preview.
+      */}
+      <div
+        className="a3-page a3-print-sheet"
+        style={{ background: tok('canvas', '#f1f5f9'), padding: '3mm', height: '297mm', display: 'flex', flexDirection: 'column' }}
+      >
+        {/* ── Header bar ──────────────────────────────────────────────────────── */}
+        <div
+          className="a3-heading flex items-center justify-between px-1 py-2 mb-2"
+          style={{ background: tok('primary', '#1d4ed8'), color: tok('text_on_primary', '#ffffff'), flexShrink: 0 }}
+        >
+          <div className="flex items-center gap-2">
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+              <rect x="3" y="3" width="7" height="7" rx="1"/><rect x="14" y="3" width="7" height="7" rx="1"/>
+              <rect x="3" y="14" width="7" height="7" rx="1"/><rect x="14" y="14" width="7" height="7" rx="1"/>
+            </svg>
+            <div>
+              <p className="text-lg font-bold uppercase">{title}</p>
+              <p className="text-[9px] opacity-75">{reportType} — Executive Summary</p>
+            </div>
+          </div>
+          <div className="text-right">
+            {dataDate && <p className="text-[11px] font-semibold">Data Date: {dataDate}</p>}
+            {weekNum   && <p className="text-[9px] opacity-75">Week {weekNum}</p>}
+          </div>
+        </div>
+
+        {/* ── Widget grid — driven entirely by a3_layout.layout.regions ───────── */}
+        <div className="a3-grid-area">
+          {!a3 ? (
+            <p className="text-xs text-gray-400 italic p-4">
+              No A3 layout configured for this report. Please ensure the a3_layout column is populated.
+            </p>
+          ) : regions.length === 0 ? (
+            <p className="text-xs text-gray-400 italic p-4">
+              No widget regions found in the A3 layout.
+            </p>
+          ) : (
+            <div className="a3-region-grid grid grid-cols-12 gap-2" style={{ gridTemplateRows: layoutRows.map(row => `minmax(80px, ${row.weight}fr)`).join(' ') }}>
+              {regions.map((region, ri) => {
+                const regionWidgets = region.widget_ids.map(id => widgetById[id]).filter(Boolean) as DashboardWidget[]
+
+                return (
+                  <div
+                    key={region.region_id ?? ri}
+                    className={`dashboard-panel ${spanClass(region.column_span)} bg-white rounded-lg border shadow-sm flex flex-col`}
+                    style={{ borderColor: tok('subtle_border', '#d5dced'), padding: '6px 8px', minWidth: 0, minHeight: 0, gridRow: placements[ri], gridColumn: region.grid_column ? `${region.grid_column} / span ${region.column_span}` : undefined }}
+                  >
+                    {/* Region title */}
+                    <p
+                      className="a3-region-title font-bold mb-1 leading-tight flex-shrink-0"
+                      style={{ color: tok('muted_text', '#94a3b8') }}
+                    >
+                      {region.title}
+                    </p>
+
+                    {/* Render each widget in the region */}
+                    {regionWidgets.length === 0 ? (
+                      <div className="flex items-center justify-center h-10 text-gray-300">
+                        <span className="text-[9px] italic">
+                          Widget{region.widget_ids.length > 1 ? 's' : ''} not loaded
+                        </span>
+                      </div>
+                    ) : regionWidgets.length === 1 ? (
+                      <div data-widget-body className="a3-widget-slot">
+                        <A3Widget region={region} widget={
+                          region.presentation_mode === 'full_width_compact_line_chart' ||
+                          region.presentation_mode === 'compact_multi_series_line_chart' ||
+                          region.presentation_mode === 'compact_line_chart'
+                            ? { ...regionWidgets[0], widget_type: 'line_chart' }
+                            : regionWidgets[0]
+                        } />
+                      </div>
+                    ) : (
+                      <div className="a3-widget-stack">
+                        {regionWidgets.map((w, wi) => (
+                          <div key={w.widget_id ?? wi} data-widget-body className="a3-widget-slot a3-widget-stack-item">
+                            {wi > 0 && (
+                              <div className="border-t my-1" style={{ borderColor: tok('subtle_border', '#e2e8f0') }} />
+                            )}
+                            {w.widget_title && (
+                              <p className="text-[8px] font-semibold uppercase tracking-wider mb-1"
+                                 style={{ color: tok('muted_text', '#94a3b8') }}>
+                                {w.widget_title}{/bar_chart/.test(w.widget_type ?? '') ? ' · Latest up to 9 observations' : ''}
+                              </p>
+                            )}
+                            <div className="a3-widget-slot"><A3Widget region={region} widget={w} /></div>
+                          </div>
+                        ))}
+                      </div>
+                    )}
+                  </div>
+                )
+              })}
+            </div>
+          )}
+        </div>
+
+        {/* ── Footer bar ──────────────────────────────────────────────────────── */}
+        {(footerCfg?.show_data_date || footerCfg?.show_report_id || footerCfg?.show_project_id || footerCfg?.show_design_version) && (
+          <div
+            className="a3-footer flex items-center justify-between px-1 py-1.5 mt-2"
+            style={{ background: tok('subtle_border', '#e2e8f0'), color: tok('text_secondary', '#64748b') }}
+          >
+            <div className="flex gap-4 text-[8px]">
+              {footerCfg?.show_project_id  && ctx?.project_id    && <span>Project: {ctx.project_id}</span>}
+              {footerCfg?.show_report_id   && ctx?.report_id     && <span>Report: {ctx.report_id}</span>}
+            </div>
+            <div className="flex gap-4 text-[8px]">
+              {footerCfg?.show_data_date      && dataDate        && <span>Data Date: {dataDate}</span>}
+              {footerCfg?.show_design_version && ctx?.design_version && <span>Design v{ctx.design_version}</span>}
+            </div>
+          </div>
+        )}
+      </div>
+    </CompactContext.Provider>
+  )
+}
+
+function A3WeeklyDashboardPage({ structure, widgets }: A3PageProps) {
+  const tok = useContext(DesignContext)
+  const isPrinting = usePrintMode()
+
+  const a3 = structure.a3_layout
+  const ctx = a3?.dashboard_context
+  const footerCfg = a3?.footer
+
+  // All regions sorted by region_order — header/footer included for grid row mapping
+  const allRegions: A3Region[] = [...(a3?.layout?.regions ?? [])]
+    .sort((a, b) => (a.region_order ?? 0) - (b.region_order ?? 0))
+
+  // Non-widget region IDs (header/footer metadata bands)
+  const nonWidgetIds = new Set(a3?.planning_metadata?.non_widget_region_ids ?? [])
+
+  // Map widget_id → DashboardWidget
+  const widgetById = useMemo(() => {
+    const m: Record<string, DashboardWidget> = {}
+    for (const w of widgets) { if (w.widget_id) m[w.widget_id] = w }
+    return m
+  }, [widgets])
+
+  const dataDate   = ctx?.data_date   ?? structure.data_date   ?? ''
+  const weekNum    = ctx?.week_num    ?? structure.week_num    ?? ''
+  const title      = ctx?.dashboard_title ?? structure.dashboard_title ?? 'Weekly Project Dashboard'
+  const reportType = ctx?.report_type ?? 'Weekly Progress Report'
+  const projectId  = ctx?.project_id  ?? ''
+  const reportId   = ctx?.report_id   ?? ''
+  const designVer  = ctx?.design_version ?? ''
+
+  // Build the page-level CSS grid row template from unique global_grid_row heights.
+  const rowHeightMap = new Map<number, number>()
+  for (const r of allRegions) {
+    const gr = r.global_grid_row ?? 0
+    if (!rowHeightMap.has(gr)) rowHeightMap.set(gr, r.height_mm ?? 42)
+  }
+  const sortedRows = [...rowHeightMap.entries()].sort((a, b) => a[0] - b[0])
+  // Map from global_grid_row number → CSS grid row index (1-based)
+  const rowToGridRow = new Map<number, number>()
+  sortedRows.forEach(([rowNum], idx) => rowToGridRow.set(rowNum, idx + 1))
+
+  // On screen: rows are auto-sized so content is never clipped.
+  // On print:  rows use exact mm heights to fit the A3 page.
+  const gridTemplateRows = isPrinting
+    ? sortedRows.map(([, h]) => `${h}mm`).join(' ')
+    : sortedRows.map(([, h]) => `minmax(${h * 3.78}px, auto)`).join(' ')
+
+  const paperMargin = 12 // mm
+
+  if (!a3) {
+    return (
+      <div className="a3-screen-page" style={{ padding: 16 }}>
+        <p className="text-xs text-gray-400 italic">
+          No A3 layout configured for this report.
+        </p>
+      </div>
+    )
+  }
+
+  return (
+    <CompactContext.Provider value={true}>
+      {/*
+        On screen: width is fixed at 420mm for layout fidelity but height is auto
+        so content is never clipped. On print: both dimensions are constrained to
+        the A3 page via @media print rules in index.css.
+      */}
+      <div
+        className="a3-screen-page"
+        style={{
+          width: '420mm',
+          height: isPrinting ? '297mm' : 'auto',
+          boxSizing: 'border-box',
+          padding: `${paperMargin}mm`,
+          background: tok('canvas', '#f6f7fb'),
+          display: 'grid',
+          gridTemplateRows,
+          gridTemplateColumns: 'repeat(12, minmax(0, 1fr))',
+          gap: '1.5mm',
+          overflow: isPrinting ? 'hidden' : 'visible',
+        }}
+      >
+        {allRegions.map((region, ri) => {
+          const gridRow    = rowToGridRow.get(region.global_grid_row ?? 0) ?? 1
+          const gridColStart = region.grid_column ?? 1
+          const gridColEnd   = gridColStart + (region.column_span ?? 1)
+          const isNonWidget  = nonWidgetIds.has(region.region_id)
+
+          // ── Header band ─────────────────────────────────────────────────────
+          if (region.band === 'header' || isNonWidget && region.band === 'header') {
+            return (
+              <div
+                key={region.region_id}
+                style={{
+                  gridRow,
+                  gridColumn: `${gridColStart} / ${gridColEnd}`,
+                  display: 'flex',
+                  justifyContent: 'space-between',
+                  alignItems: 'center',
+                  borderBottom: `1px solid ${tok('subtle_border', '#dce1ed')}`,
+                  paddingBottom: '1.5mm',
+                  minWidth: 0,
+                  minHeight: 0,
+                  overflow: 'hidden',
+                }}
+              >
+                <div>
+                  <div style={{ fontSize: '15pt', fontWeight: 800, margin: 0, letterSpacing: -0.4, color: tok('text_primary', '#18233d'), lineHeight: 1.2 }}>
+                    {title}
+                  </div>
+                  <div style={{ fontSize: '7pt', color: tok('text_secondary', '#647189'), lineHeight: 1.4 }}>
+                    {reportType} · A3 Executive Summary
+                  </div>
+                </div>
+                <div style={{ textAlign: 'right', fontSize: '7pt', color: tok('text_secondary', '#647189'), lineHeight: 1.5 }}>
+                  {projectId && <div>Project: <strong>{projectId}</strong></div>}
+                  {weekNum   && <div>Week {weekNum}</div>}
+                  {dataDate  && <div>Data Date: <strong>{dataDate}</strong></div>}
+                </div>
+              </div>
+            )
+          }
+
+          // ── Footer band ─────────────────────────────────────────────────────
+          if (region.band === 'footer' || isNonWidget && region.band === 'footer') {
+            return (
+              <div
+                key={region.region_id}
+                style={{
+                  gridRow,
+                  gridColumn: `${gridColStart} / ${gridColEnd}`,
+                  display: 'flex',
+                  justifyContent: 'space-between',
+                  alignItems: 'center',
+                  fontSize: '6.5pt',
+                  color: tok('text_secondary', '#647189'),
+                  minWidth: 0,
+                  minHeight: 0,
+                  overflow: 'hidden',
+                }}
+              >
+                <div style={{ display: 'flex', gap: '6mm' }}>
+                  {footerCfg?.show_project_id  && projectId && <span>Project: {projectId}</span>}
+                  {footerCfg?.show_report_id   && reportId  && <span>Report ID: {reportId}</span>}
+                </div>
+                <div style={{ display: 'flex', gap: '6mm' }}>
+                  {footerCfg?.show_data_date      && dataDate  && <span>Data Date: {dataDate}</span>}
+                  {footerCfg?.show_design_version && designVer && <span>Design v{designVer}</span>}
+                </div>
+              </div>
+            )
+          }
+
+          // ── Widget panel ─────────────────────────────────────────────────────
+          const regionWidgets = region.widget_ids.map(id => widgetById[id]).filter(Boolean) as DashboardWidget[]
+
+          return (
+            <div
+              key={region.region_id ?? ri}
+              className="dashboard-panel"
+              style={{
+                gridRow,
+                gridColumn: `${gridColStart} / ${gridColEnd}`,
+                border: `1px solid ${tok('subtle_border', '#dce2ee')}`,
+                borderRadius: 7,
+                background: '#fff',
+                minWidth: 0,
+                minHeight: 0,
+                overflow: isPrinting ? 'hidden' : 'visible',
+                padding: '2mm 2.4mm 1.8mm',
+                display: 'flex',
+                flexDirection: 'column',
+              }}
+            >
+              {/* Panel title */}
+              <div className="dashboard-panel-title" style={{
+                fontSize: '8pt', fontWeight: 800, color: tok('text_primary', '#22314b'),
+                whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis',
+                flexShrink: 0, marginBottom: '2mm', lineHeight: 1.2,
+              }}>
+                {region.title}
+              </div>
+
+              {/* Widget content */}
+              <div style={{ flex: 1, minHeight: isPrinting ? 0 : 'auto', position: 'relative' }}>
+                {regionWidgets.length === 0 ? (
+                  <div style={{
+                    height: '100%', display: 'flex', alignItems: 'center', justifyContent: 'center',
+                    flexDirection: 'column', gap: 4, background: '#fafbfe',
+                    border: '1px dashed #d6dfec', borderRadius: 5, padding: '2mm',
+                  }}>
+                    <span style={{ fontSize: '14pt', color: '#9aa6b9' }}>⋯</span>
+                    <span style={{ fontSize: '7pt', fontWeight: 600, color: '#64718a' }}>
+                      {region.widget_ids.length > 0 ? 'Data not loaded' : 'No data'}
+                    </span>
+                  </div>
+                ) : regionWidgets.length === 1 ? (
+                  <WidgetInner widget={regionWidgets[0]} />
+                ) : (
+                  <div style={{ display: 'flex', flexDirection: 'column', gap: '1.5mm', height: '100%' }}>
+                    {regionWidgets.map((w, wi) => (
+                      <div key={w.widget_id ?? wi} style={{ flex: 1, minHeight: 0, display: 'flex', flexDirection: 'column' }}>
+                        {wi > 0 && <div style={{ borderTop: `1px solid ${tok('subtle_border', '#e2e8f0')}`, marginBottom: '1mm' }} />}
+                        {w.widget_title && (
+                          <div style={{ fontSize: '7pt', fontWeight: 700, color: tok('muted_text', '#94a3b8'), marginBottom: '1mm', textTransform: 'uppercase', letterSpacing: '0.03em' }}>
+                            {w.widget_title}
+                          </div>
+                        )}
+                        <div style={{ flex: 1, minHeight: 0 }}>
+                          <WidgetInner widget={w} />
+                        </div>
+                      </div>
+                    ))}
+                  </div>
+                )}
+              </div>
+            </div>
+          )
+        })}
+      </div>
+    </CompactContext.Provider>
+  )
+}
+
+
+// ── Main Component ────────────────────────────────────────────────────────────
+
+// ── Data-loading helpers ──────────────────────────────────────────────────────
+
+// The week list only needs light columns; the heavy JSON is fetched for the selected week only
+const STRUCTURE_LIST_COLS = 'structure_id, report_id, project_id, week_num, data_date, dashboard_title, processing_status, is_approved'
+const STRUCTURE_FULL_COLS = STRUCTURE_LIST_COLS + ', design_id, structure_plan, a3_layout'
+const NO_WIDGETS: DashboardWidget[] = []
+
+// JSON columns may arrive as strings (or double-encoded) from Supabase — parse safely
+function parseJsonCol(raw: unknown): unknown {
+  if (raw == null) return null
+  if (typeof raw === 'object' && !Array.isArray(raw)) return raw
+  if (typeof raw === 'string') {
+    try {
+      const once = JSON.parse(raw)
+      if (typeof once === 'string') { try { return JSON.parse(once) } catch { return null } }
+      return once
+    } catch { return null }
+  }
+  return null
+}
+
+function parseAst(raw: unknown): Record<string, unknown> {
+  const v = parseJsonCol(raw)
+  return v != null && typeof v === 'object' && !Array.isArray(v) ? (v as Record<string, unknown>) : {}
+}
+
+// Memoised page layouts — a page only re-renders when its own props change
+const MemoExecutiveOverviewPage    = memo(ExecutiveOverviewPage)
+const MemoProgressAnalysisPage     = memo(ProgressAnalysisPage)
+const MemoScheduleIntelligencePage = memo(ScheduleIntelligencePage)
+const MemoEngineeringQAPage        = memo(EngineeringQAPage)
+const MemoResourcesManpowerPage    = memo(ResourcesManpowerPage)
+const MemoKpiPerformancePage       = memo(KpiPerformancePage)
+
+// Placeholder shown while data loads — reserves page height so the layout doesn't collapse or jump
+function DashboardSkeleton() {
+  return (
+    <div className="animate-pulse space-y-4" style={{ minHeight: '80vh' }} aria-busy="true" aria-label="Loading dashboard">
+      <div className="h-16 rounded-2xl bg-gray-200/70" />
+      <div className="grid grid-cols-2 lg:grid-cols-4 gap-3">
+        {[0, 1, 2, 3].map(i => <div key={i} className="h-24 rounded-2xl bg-gray-200/70" />)}
+      </div>
+      <div className="h-72 rounded-2xl bg-gray-200/70" />
+      <div className="grid grid-cols-1 lg:grid-cols-2 gap-3">
+        <div className="h-64 rounded-2xl bg-gray-200/70" />
+        <div className="h-64 rounded-2xl bg-gray-200/70" />
+      </div>
+    </div>
+  )
+}
+
+export function ReportDashboardForm({
+  projectId,
+  projectTextId,
+  schemaName,
+  a3Mode = false,
+  targetReportId,
+}: {
+  projectId: string
+  projectTextId: string
+  schemaName: string
+  a3Mode?: boolean
+  targetReportId?: string
+}) {
+  void projectId
+
+  const [structures, setStructures] = useState<DashboardStructure[]>([])
+  const [loadingStructures, setLoadingStructures] = useState(true)
+  const [selectedStructureId, setSelectedStructureId] = useState<string>('')
+  const [selectedStructure, setSelectedStructure] = useState<DashboardStructure | null>(null)
+  const [widgets, setWidgets] = useState<DashboardWidget[]>([])
+  // true until the first structure+widgets fetch settles — avoids a one-frame "No pages" flash
+  const [loadingWidgets, setLoadingWidgets] = useState(true)
+  const [activePageId, setActivePageId] = useState<string>('')
+  const [tok, setTok] = useState<ReturnType<typeof buildTokenResolver>>(() => DEFAULT_TOK)
+  const { notification, showError, hideNotification } = useNotification()
+
+  // Fetch the week list. Only light columns — the heavy JSON (structure_plan / a3_layout)
+  // is fetched for the selected week only, in parallel with its widgets (effect below).
+  useEffect(() => {
+    if (!schemaName || schemaName === 'public') return
+    let cancelled = false
+    const load = async () => {
+      setLoadingStructures(true)
+      setStructures([])
+      setSelectedStructureId('')
+      setSelectedStructure(null)
+      setWidgets([])
+      try {
+        const db = schemaClient(schemaName)
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        let query = (db as any)
+          .from('dbp6_0008_dashboard_structures')
+          .select(STRUCTURE_LIST_COLS)
+          .order('data_date', { ascending: false })
+        if (projectTextId) query = query.eq('project_id', projectTextId)
+        if (targetReportId) query = query.eq('report_id', targetReportId)
+        const { data, error } = await query
+        if (cancelled) return
+        if (error) throw new Error(error.message)
+        const rows = ((data ?? []) as DashboardStructure[]).map(s => ({ ...s, structure_plan: null, a3_layout: null }))
+        setStructures(rows)
+        if (rows.length > 0) setSelectedStructureId(rows[0].structure_id)
+        else setLoadingWidgets(false)
+      } catch (err) {
+        if (cancelled) return
+        setLoadingWidgets(false)
+        showError(err instanceof Error ? err.message : 'Failed to load report list')
+      }
+      if (!cancelled) setLoadingStructures(false)
+    }
+    load()
+    return () => { cancelled = true }
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [schemaName, projectTextId, targetReportId])
+
+  // Fetch the selected week's full structure AND its widgets in parallel.
+  // `cancelled` drops stale responses when the user switches weeks quickly.
+  useEffect(() => {
+    if (!selectedStructureId) return
+    let cancelled = false
+    const load = async () => {
+      setLoadingWidgets(true)
+      setWidgets([])
+      setSelectedStructure(null)
+      setTok(() => DEFAULT_TOK)
+      try {
+        const db = schemaClient(schemaName)
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        const anyDb = db as any
+        const [structRes, widgetRes] = await Promise.all([
+          anyDb.from('dbp6_0008_dashboard_structures')
+            .select(STRUCTURE_FULL_COLS)
+            .eq('structure_id', selectedStructureId)
+            .maybeSingle(),
+          anyDb.from('dbp6_0008_dashboard_widgets')
+            .select('widget_record_id, structure_id, page_id, widget_id, widget_order, widget_title, widget_type, widget_ast')
+            .eq('structure_id', selectedStructureId)
+            .order('widget_order', { ascending: true }),
+        ])
+        if (cancelled) return
+        if (structRes.error) throw structRes.error
+        if (widgetRes.error) throw widgetRes.error
+        const sRow = structRes.data as DashboardStructure | null
+        let designQuery = anyDb.from('dbp6_0008_dashboard_designs')
+          .select('design_id, design_name, design_version, design_specification, is_approved, is_default')
+        const layout = parseJsonCol(sRow?.a3_layout) as A3Layout | null
+        const designId = sRow?.design_id ?? layout?.dashboard_context?.design_id
+        // A linked design is authoritative, even if not the schema's default.
+        // Fall back to an approved default only when no design was linked.
+        designQuery = designId ? designQuery.eq('design_id', designId)
+          : designQuery.eq('is_approved', true).eq('is_default', true)
+        const designResult = await designQuery.maybeSingle()
+        if (cancelled) return
+        if (designResult.error || !designResult.data) {
+          showError(designId ? `Linked dashboard design ${designId} could not be loaded. Showing fallback styling.` : 'No default dashboard design is available. Showing fallback styling.')
+        } else {
+          const spec = parseJsonCol((designResult.data as DashboardDesign).design_specification)
+          setTok(() => buildTokenResolver(designObject(spec)))
+        }
+        setSelectedStructure(sRow ? {
+          ...sRow,
+          structure_plan: parseJsonCol(sRow.structure_plan) as DashboardStructure['structure_plan'],
+          a3_layout: parseJsonCol(sRow.a3_layout) as A3Layout | null,
+        } : null)
+        setWidgets(((widgetRes.data ?? []) as DashboardWidget[]).map(w => ({
+          ...w,
+          widget_ast: parseAst(w.widget_ast),
+        })))
+      } catch (err) {
+        if (cancelled) return
+        showError(err instanceof Error ? err.message : 'Failed to load widgets')
+      }
+      if (!cancelled) setLoadingWidgets(false)
+    }
+    load()
+    return () => { cancelled = true }
+  }, [selectedStructureId, schemaName])
+
+  // Parsed once per structure instead of re-deriving pages on every render
+  const pages = useMemo<StructurePlanPage[]>(() => {
+    const raw = selectedStructure?.structure_plan?.pages
+    return raw ? [...raw].sort((a, b) => (a.page_order ?? 0) - (b.page_order ?? 0)) : []
+  }, [selectedStructure])
+
+  // Group widgets by page once. Stable array identities let React.memo skip pages whose
+  // widgets did not change (otherwise every scroll-driven nav highlight re-rendered all charts).
+  const widgetsByPage = useMemo(() => {
+    const m = new Map<string, DashboardWidget[]>()
+    for (const w of widgets) {
+      if (!w.page_id) continue
+      const list = m.get(w.page_id)
+      if (list) list.push(w); else m.set(w.page_id, [w])
+    }
+    return m
+  }, [widgets])
+
+  const handleStructureChange = useCallback((e: React.ChangeEvent<HTMLSelectElement>) => {
+    setSelectedStructureId(e.target.value)
+  }, [])
+
+  // Set initial active page when pages load
+  useEffect(() => {
+    if (pages.length > 0) setActivePageId(pages[0].page_id)
+  }, [pages])
+
+  // IntersectionObserver — track which section is most visible
+  // Runs after widgets finish loading so the section divs exist in the DOM
+  useEffect(() => {
+    if (!pages.length || loadingWidgets) return
+    const observers: IntersectionObserver[] = []
+    const visibilityMap: Record<string, number> = {}
+
+    // Use the <main> scroll container as the root so intersection is
+    // calculated within the visible scroll area, not the document
+    const scrollRoot = document.querySelector('main') ?? null
+
+    pages.forEach(page => {
+      const el = document.getElementById(`section-${page.page_id}`)
+      if (!el) return
+      const obs = new IntersectionObserver(
+        ([entry]) => {
+          visibilityMap[page.page_id] = entry.intersectionRatio
+          const best = Object.entries(visibilityMap).sort((a, b) => b[1] - a[1])[0]
+          if (best && best[1] > 0) setActivePageId(best[0])
+        },
+        { root: scrollRoot, threshold: [0, 0.05, 0.1, 0.25, 0.5] }
+      )
+      obs.observe(el)
+      observers.push(obs)
+    })
+
+    return () => observers.forEach(o => o.disconnect())
+  }, [pages.length, selectedStructureId, loadingWidgets])
+
+  function scrollToPage(pageId: string) {
+    const el = document.getElementById(`section-${pageId}`)
+    if (el) el.scrollIntoView({ behavior: 'smooth', block: 'start' })
+  }
+
+  // Register A3 print scale hook (no-op when a3Mode is false)
+  useA3PrintScale(a3Mode)
+
+  // ── Render ───────────────────────────────────────────────────────────────────
+
+  if (loadingStructures) return <DashboardSkeleton />
+
+  if (structures.length === 0) {
+    return (
+      <div className="flex flex-col items-center justify-center py-24 text-center">
+        <svg className="w-12 h-12 text-gray-300 mb-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+          <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1.5} d="M9 17v-2m3 2v-4m3 4v-6m2 10H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z" />
+        </svg>
+        <p className="text-gray-500 font-medium">No reports available</p>
+        <p className="text-gray-400 text-sm mt-1">Reports are generated automatically after each weekly update.</p>
+      </div>
+    )
+  }
+
+  const reportDataDate = selectedStructure?.data_date ?? ''
+
+  // ── A3 mode — render the single-page summary layout ────────────────────────
+  if (a3Mode) {
+    const isLoading = loadingStructures || loadingWidgets
+    return (
+      <DesignContext.Provider value={tok}>
+      <DataDateContext.Provider value={reportDataDate}>
+      <div className="dashboard-design" style={dashboardDesignStyle(tok.spec, tok)}>
+        {notification && <Notification type={notification.type} message={notification.message} onClose={hideNotification} />}
+
+        {/* A3 toolbar — hidden on print */}
+        <div className="no-print flex flex-wrap gap-2 items-center justify-between px-4 py-2 mb-2 border-b" style={{ borderColor: tok('subtle_border', '#e2e8f0') }}>
+          <div className="flex items-center gap-3">
+            <select
+              value={selectedStructureId}
+              onChange={handleStructureChange}
+              style={{ fontSize: 11, color: '#374151', background: '#f8fafc', border: '1px solid #e2e8f0', borderRadius: 6, padding: '4px 8px', outline: 'none' }}
+            >
+              {structures.map(s => (
+                <option key={s.structure_id} value={s.structure_id}>
+                  {s.week_num != null ? `Week ${s.week_num}` : 'Week —'} · {fmtDate(s.data_date)}
+                </option>
+              ))}
+            </select>
+            <span className="text-[10px] text-gray-400">Weekly Project Dashboard — A3 Executive Summary</span>
+          </div>
+          <button
+            onClick={() => { void printDashboard() }}
+            style={{
+              display: 'inline-flex', alignItems: 'center', gap: 6,
+              fontSize: 11, fontWeight: 600, padding: '6px 14px', borderRadius: 6,
+              background: tok('primary', '#1d4ed8'), color: '#fff', border: 'none', cursor: 'pointer',
+              boxShadow: '0 1px 4px rgba(0,0,0,0.15)',
+            }}
+          >
+            <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+              <path d="M6 9V2h12v7M6 18H4a2 2 0 01-2-2v-5a2 2 0 012-2h16a2 2 0 012 2v5a2 2 0 01-2 2h-2" />
+              <rect x="6" y="14" width="12" height="8" rx="1" />
+            </svg>
+            Print A3
+          </button>
+        </div>
+
+        {isLoading ? (
+          <div className="flex items-center justify-center py-16"><LoadingSpinner /></div>
+        ) : !selectedStructure ? (
+          <p className="text-xs text-gray-400 italic p-6">No dashboard structure available.</p>
+        ) : (
+          <div className="a3-print-root">
+            <A3WeeklyDashboardPage structure={selectedStructure} widgets={widgets} />
+            <A3PrintDashboardPage structure={selectedStructure} widgets={widgets} />
+          </div>
+        )}
+      </div>
+      </DataDateContext.Provider>
+      </DesignContext.Provider>
+    )
+  }
+
+  return (
+    <DesignContext.Provider value={tok}>
+    <DataDateContext.Provider value={reportDataDate}>
+    <div className="flex gap-4 items-start" style={{ maxWidth: '100%' }}>
+
+      {/* ── Left nav ─────────────────────────────────────────────────────── */}
+      {pages.length > 0 && (
+        <nav className="no-print hidden lg:flex flex-col w-56 flex-shrink-0" style={{ position: 'sticky', top: '0', maxHeight: 'calc(100vh - 5rem)' }}>
+          <div className="rounded-2xl overflow-hidden flex flex-col" style={{ background: tok('sidebar_bg', '#ffffff'), border: `1px solid ${tok('subtle_border', '#e2e8f0')}`, boxShadow: '0 2px 16px rgba(0,0,0,0.08)' }}>
+            {/* Header */}
+            <div className="px-4 py-3 flex items-center gap-2.5 flex-shrink-0" style={{ borderBottom: `1px solid ${tok('subtle_border', '#e2e8f0')}` }}>
+              <svg className="w-3.5 h-3.5 flex-shrink-0" fill="none" viewBox="0 0 24 24" stroke="currentColor" style={{ color: tok('primary', '#3b82f6') }}>
+                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2.5} d="M4 6h16M4 12h16M4 18h7" />
+              </svg>
+              <p className="text-xs font-bold uppercase tracking-widest" style={{ color: tok('muted_text', '#94a3b8') }}>Pages</p>
+            </div>
+            {/* Items */}
+            <ul className="py-2 overflow-y-auto flex-1" style={{ scrollbarWidth: 'none' }}>
+              {pages.map((page, idx) => {
+                const isActive = activePageId === page.page_id
+                return (
+                  <li key={page.page_id} className="px-2 py-0.5">
+                    <button
+                      onClick={() => scrollToPage(page.page_id)}
+                      className="w-full flex items-center gap-3 px-3 py-2 rounded-lg text-left text-sm transition-colors"
+                      style={{
+                        background:  isActive ? tok('sidebar_active_bg', '#eff6ff') : 'transparent',
+                        color:       isActive ? tok('primary', '#1d4ed8')            : tok('text_secondary', '#6b7280'),
+                        fontWeight:  isActive ? 600 : 400,
+                        borderLeft:  isActive ? `2px solid ${tok('primary', '#2563eb')}` : '2px solid transparent',
+                      }}
+                    >
+                      <span className="w-5 h-5 rounded text-[10px] font-bold flex items-center justify-center flex-shrink-0 transition-colors" style={{
+                        background: isActive ? tok('primary', '#2563eb')    : tok('surface_secondary', '#eff6ff'),
+                        color:      isActive ? tok('text_on_primary', '#fff') : tok('primary', '#3b82f6'),
+                      }}>
+                        {idx + 1}
+                      </span>
+                      <span className="leading-snug line-clamp-2 tracking-tight">{page.title}</span>
+                    </button>
+                  </li>
+                )
+              })}
+            </ul>
+          </div>
+        </nav>
+      )}
+
+      {/* ── Main content ───────────────────────────────────────────────────── */}
+      <div className="flex-1 min-w-0">
+
+        {notification && (
+          <Notification type={notification.type} message={notification.message} onClose={hideNotification} />
+        )}
+
+        {loadingWidgets ? (
+          <DashboardSkeleton />
+        ) : pages.length === 0 ? (
+          <div className="flex items-center justify-center py-24 text-gray-400 text-sm">No pages defined for this report.</div>
+        ) : (
+          pages.map((page, pageIdx) => {
+            const pageWidgets = widgetsByPage.get(page.page_id) ?? NO_WIDGETS
+            // Route by page_key first (stable semantic value from DB), then fall back to pageIdx
+            const pk = (page.page_key ?? '').toLowerCase()
+            const isExecutivePage        = pk === 'executive_overview'        || pageIdx === 0
+            const isProgressAnalysis     = pk === 'progress_analysis'         || (pk === '' && pageIdx === 1)
+            const isScheduleIntelligence = pk === 'schedule_intelligence'     || (pk === '' && pageIdx === 2)
+            const isEngineeringQA        = pk === 'engineering_qaqc_hse'      || (pk === '' && pageIdx === 3)
+            const isResourcesManpower    = pk === 'resources_and_manpower'    || (pk === '' && pageIdx === 4)
+            const isKpiPerformance       = pk === 'kpi_performance'           || (pk === '' && pageIdx === 5)
+
+            return (
+              <div
+                key={page.page_id}
+                id={`section-${page.page_id}`}
+                className={`print-page${pageIdx > 0 ? ' mt-6' : ''}`}
+              >
+                {isExecutivePage ? (
+                  // Special rich layout for the Executive Overview page
+                  <MemoExecutiveOverviewPage
+                    page={page}
+                    pageIdx={pageIdx}
+                    pageWidgets={pageWidgets}
+                    structure={selectedStructure!}
+                    structures={structures}
+                    selectedStructureId={selectedStructureId}
+                    onStructureChange={handleStructureChange}
+                  />
+                ) : isProgressAnalysis ? (
+                  // 5-row custom layout for Progress Analysis page
+                  <MemoProgressAnalysisPage
+                    page={page}
+                    pageIdx={pageIdx}
+                    pageWidgets={pageWidgets}
+                  />
+                ) : isScheduleIntelligence ? (
+                  // 5-row custom layout for Schedule Intelligence page
+                  <MemoScheduleIntelligencePage
+                    page={page}
+                    pageIdx={pageIdx}
+                    pageWidgets={pageWidgets}
+                  />
+                ) : isEngineeringQA ? (
+                  // 7-row custom layout for Engineering, QA/QC and HSE page
+                  <MemoEngineeringQAPage
+                    page={page}
+                    pageIdx={pageIdx}
+                    pageWidgets={pageWidgets}
+                  />
+                ) : isResourcesManpower ? (
+                  // 4-row custom layout for Resources and Manpower page
+                  <MemoResourcesManpowerPage
+                    page={page}
+                    pageIdx={pageIdx}
+                    pageWidgets={pageWidgets}
+                  />
+                ) : isKpiPerformance ? (
+                  // 5-row custom layout for KPI Performance page
+                  <MemoKpiPerformancePage
+                    page={page}
+                    pageIdx={pageIdx}
+                    pageWidgets={pageWidgets}
+                  />
+                ) : (
+                  <>
+                    {/* Section header — compact bar */}
+                    <div className="flex items-center gap-2 mb-3">
+                      <span className="w-5 h-5 rounded-md text-white text-[10px] font-bold flex items-center justify-center flex-shrink-0"
+                        style={{ background: 'linear-gradient(135deg, #3b82f6, #1d4ed8)' }}
+                      >
+                        {pageIdx + 1}
+                      </span>
+                      <h2 className="text-sm font-bold text-gray-700 tracking-wide">{page.title}</h2>
+                      {page.subtitle && (
+                        <span className="text-xs text-gray-400 font-normal">— {page.subtitle}</span>
+                      )}
+                    </div>
+
+                    {/* Widget grid — 4 cols on large screens */}
+                    {pageWidgets.length === 0 ? (
+                      <p className="text-xs text-gray-400 italic mb-4">No content on this page.</p>
+                    ) : (
+                      <div className="grid grid-cols-4 gap-3 mb-2">
+                        {pageWidgets.map(w => (
+                          <WidgetRenderer key={w.widget_record_id} widget={w} />
+                        ))}
+                      </div>
+                    )}
+                  </>
+                )}
+              </div>
+            )
+          })
+        )}
+      </div>
+    </div>
+    </DataDateContext.Provider>
+    </DesignContext.Provider>
+  )
+}

@@ -1,0 +1,444 @@
+{
+  "paper": {
+    "size": "A3",
+    "orientation": "landscape"
+  },
+  "footer": {
+    "show_data_date": true,
+    "show_report_id": true,
+    "show_project_id": true,
+    "show_design_version": true
+  },
+  "layout": {
+    "columns": 12,
+    "regions": [
+      {
+        "band": "header",
+        "title": "Project Header",
+        "grid_row": 1,
+        "row_span": 1,
+        "height_mm": 12,
+        "region_id": "REG-001",
+        "widget_ids": [],
+        "column_span": 12,
+        "grid_column": 1,
+        "region_order": 1,
+        "global_grid_row": 1,
+        "presentation_mode": "header_metadata",
+        "presentation_notes": "Compact single-line header: dashboard title, project ID PRJ-ATGC-01, report title Weekly Progress Report, Week 54, Data Date 27-Sep-2026 and Report ID 3890b37e-3f16-418b-827e-1bdb93171844. Project name is not supplied in dashboard_context and is not fabricated."
+      },
+      {
+        "band": "executive",
+        "title": "Overall Progress Position",
+        "grid_row": 1,
+        "row_span": 1,
+        "height_mm": 30,
+        "region_id": "REG-002",
+        "widget_ids": [
+          "WGT-002"
+        ],
+        "column_span": 7,
+        "grid_column": 1,
+        "region_order": 2,
+        "global_grid_row": 2,
+        "presentation_mode": "horizontal_kpi_group",
+        "presentation_notes": "Three horizontal KPI cards: cumulative planned, cumulative actual and progress variance. Previous-week cumulative planned comparison is unavailable because the baseline planned series has no 24-Sep-2026 observation; null is preserved, not zero-filled. Current actual reporting period is a partial 3-day period and is qualified. No interpolation or invented comparison."
+      },
+      {
+        "band": "executive",
+        "title": "Executive Schedule Position",
+        "grid_row": 1,
+        "row_span": 1,
+        "height_mm": 30,
+        "region_id": "REG-003",
+        "widget_ids": [
+          "WGT-003"
+        ],
+        "column_span": 5,
+        "grid_column": 8,
+        "region_order": 3,
+        "global_grid_row": 2,
+        "presentation_mode": "horizontal_kpi_group",
+        "presentation_notes": "Four horizontal KPI cards: forecast completion date, current project delay, critical activity count and schedule status. Critical activity count is unchanged week-on-week at 2,257 and is not by itself evidence of schedule improvement. Delayed schedule status is preserved from source."
+      },
+      {
+        "band": "main",
+        "title": "Cumulative Planned vs Actual Progress",
+        "grid_row": 1,
+        "row_span": 1,
+        "height_mm": 42,
+        "region_id": "REG-004",
+        "widget_ids": [
+          "WGT-008"
+        ],
+        "column_span": 4,
+        "grid_column": 1,
+        "region_order": 4,
+        "global_grid_row": 3,
+        "presentation_mode": "cumulative_planned_vs_actual_line_chart",
+        "presentation_notes": "Line chart uses separate verified period-end dates for planned and actual series. Irregular observation dates and null gaps are preserved. Only the 27-Sep-2026 planned and actual cumulative values are directly comparable. No resampling, interpolation or zero substitution; baseline periods after the data date are not plotted."
+      },
+      {
+        "band": "main",
+        "title": "Weekly Planned vs Actual Progress and Variance",
+        "grid_row": 1,
+        "row_span": 1,
+        "height_mm": 42,
+        "region_id": "REG-005",
+        "widget_ids": [
+          "WGT-009",
+          "WGT-010"
+        ],
+        "column_span": 5,
+        "grid_column": 5,
+        "region_order": 5,
+        "global_grid_row": 3,
+        "presentation_mode": "combined_weekly_progress_panel",
+        "presentation_notes": "Two independent mini-charts side by side within one panel: WGT-009 weekly planned vs actual percentage-point grouped bars; WGT-010 weekly planned vs actual variance percentage-point grouped bars. Separate titles, captions, legends and datasets are retained. Confirmed zeros remain zero; W54 partial period and baseline/reporting week mapping are qualified. No merged dataset or new variance calculation."
+      },
+      {
+        "band": "main",
+        "title": "Progress by Phase",
+        "grid_row": 1,
+        "row_span": 1,
+        "height_mm": 42,
+        "region_id": "REG-006",
+        "widget_ids": [
+          "WGT-013"
+        ],
+        "column_span": 3,
+        "grid_column": 10,
+        "region_order": 6,
+        "global_grid_row": 3,
+        "presentation_mode": "grouped_planned_vs_actual_phase_bars",
+        "presentation_notes": "Eight phase categories plotted in source order with planned and actual groups. Use compact phase-code labels where space requires. Supplied zero values are preserved. Unresolved phase names remain original codes. Variance is not plotted as a chart series."
+      },
+      {
+        "band": "main",
+        "title": "Trade Schedule Comparison",
+        "grid_row": 2,
+        "row_span": 1,
+        "height_mm": 42,
+        "region_id": "REG-007",
+        "widget_ids": [
+          "WGT-014"
+        ],
+        "column_span": 6,
+        "grid_column": 1,
+        "region_order": 7,
+        "global_grid_row": 4,
+        "presentation_mode": "selected_eight_trade_comparative_gantt",
+        "presentation_notes": "Eight-trade comparative Gantt selected from 29 authoritative trade records. Planned bars use lavender/violet and actual/progress markers use mint. Shared chronological date axis with Data Date reference at 27-Sep-2026. Compact trade labels and legend; reduce row padding and label length before reducing displayed trades. Actual finish dates for in-progress trades are labelled as latest verified activity actual finish, not overall trade completion. No forecast trade finish dates were supplied or inferred.",
+        "presentation_selection": {
+          "maximum_items": 8,
+          "selection_type": "top_8_major_construction_trades",
+          "selection_basis": [
+            "reported_progress_exposure",
+            "verified_active_work",
+            "representative_coverage"
+          ],
+          "source_record_count": 29,
+          "selected_trade_codes": [
+            "ST",
+            "WP",
+            "SW",
+            "MS",
+            "EL",
+            "PL",
+            "PS",
+            "PN"
+          ],
+          "displayed_record_count": 8
+        }
+      },
+      {
+        "band": "main",
+        "title": "Critical / Driving Activities",
+        "grid_row": 2,
+        "row_span": 1,
+        "height_mm": 42,
+        "region_id": "REG-008",
+        "widget_ids": [
+          "WGT-017"
+        ],
+        "column_span": 3,
+        "grid_column": 7,
+        "region_order": 8,
+        "global_grid_row": 4,
+        "presentation_mode": "critical_driving_activities_unavailable_state",
+        "presentation_notes": "No authoritative WGT-017 Widget AST was supplied. Display an explicit unavailable-data state only. Do not invent activities, critical/driving classifications, float values, dates or urgency. When authoritative data is available, limit to six verified critical/driving activities."
+      },
+      {
+        "band": "main",
+        "title": "QA/QC Status Summary",
+        "grid_row": 2,
+        "row_span": 1,
+        "height_mm": 42,
+        "region_id": "REG-009",
+        "widget_ids": [
+          "WGT-028"
+        ],
+        "column_span": 3,
+        "grid_column": 10,
+        "region_order": 9,
+        "global_grid_row": 4,
+        "presentation_mode": "qaqc_open_closed_stacked_bar",
+        "presentation_notes": "Stacked open/closed counts by CIVIL, MEP and HSE. Preserve supplied OPN/CLS counts and open-over-14-days totals. Documents without a recorded OPN/CLS status are not displayed as zero or inferred. Compact legend and axis labels."
+      },
+      {
+        "band": "main",
+        "title": "Engineering Submission Trends",
+        "grid_row": 3,
+        "row_span": 1,
+        "height_mm": 42,
+        "region_id": "REG-010",
+        "widget_ids": [
+          "WGT-026"
+        ],
+        "column_span": 3,
+        "grid_column": 1,
+        "region_order": 10,
+        "global_grid_row": 5,
+        "presentation_mode": "engineering_submission_trend_line_chart",
+        "presentation_notes": "Four-week cumulative distinct submission trend for Prequalification, Shop Drawings and Materials at W51-W54. Preserve cumulative definitions; do not convert cumulative values into weekly increments. Flat segments are source-reported unchanged cumulative totals, not missing data. Source scope exclusions and unmapped records are qualified."
+      },
+      {
+        "band": "main",
+        "title": "Engineering Status: Prequalification",
+        "grid_row": 3,
+        "row_span": 1,
+        "height_mm": 42,
+        "region_id": "REG-011",
+        "widget_ids": [
+          "WGT-022"
+        ],
+        "column_span": 3,
+        "grid_column": 4,
+        "region_order": 11,
+        "global_grid_row": 5,
+        "presentation_mode": "compact_status_donut",
+        "presentation_notes": "Compact donut for PRQ statuses A/B/C/D/UR. Zero-count categories are retained. Displayed shares use the 79 transmittals with identified status, not all 82 total transmittals. The 3 unclassified transmittals are excluded from shares and are not allocated to any status. Status codes are displayed verbatim."
+      },
+      {
+        "band": "main",
+        "title": "Engineering Status: Shop Drawings",
+        "grid_row": 3,
+        "row_span": 1,
+        "height_mm": 42,
+        "region_id": "REG-012",
+        "widget_ids": [
+          "WGT-023"
+        ],
+        "column_span": 3,
+        "grid_column": 7,
+        "region_order": 12,
+        "global_grid_row": 5,
+        "presentation_mode": "compact_status_donut",
+        "presentation_notes": "Compact donut for DWG statuses A/B/C/D/UR. All categories are preserved, including zero-count Status A. Displayed shares use the 2,023 categorised transmittals, not all 3,664 total transmittals. The 1,641 transmittals without a recorded status are excluded from shares. No status meaning is inferred."
+      },
+      {
+        "band": "main",
+        "title": "Engineering Status: Materials",
+        "grid_row": 3,
+        "row_span": 1,
+        "height_mm": 42,
+        "region_id": "REG-013",
+        "widget_ids": [
+          "WGT-024"
+        ],
+        "column_span": 3,
+        "grid_column": 10,
+        "region_order": 13,
+        "global_grid_row": 5,
+        "presentation_mode": "compact_status_donut",
+        "presentation_notes": "Compact donut for MAT statuses A/B/C/D/UR. Zero-count Status A is retained. Displayed shares use the 160 material transmittals with recorded status, not all 253 total. The 93 transmittals without status are excluded from shares. The UR status count is not the same measure as under-review aging."
+      },
+      {
+        "band": "bottom",
+        "title": "Manpower Performance",
+        "grid_row": 1,
+        "row_span": 1,
+        "height_mm": 42,
+        "region_id": "REG-014",
+        "widget_ids": [
+          "WGT-033"
+        ],
+        "column_span": 4,
+        "grid_column": 1,
+        "region_order": 14,
+        "global_grid_row": 6,
+        "presentation_mode": "planned_vs_actual_manpower_trend",
+        "presentation_notes": "Weekly planned-versus-actual manpower line chart. Actual manpower gaps for 64 unavailable periods remain gaps and must not be read as zero. Planned series remains complete as supplied. W54 covers 2 working days and is qualified. Peak actual reference is preserved. No interpolation or recalculation."
+      },
+      {
+        "band": "bottom",
+        "title": "Cumulative KPI Quantities",
+        "grid_row": 1,
+        "row_span": 1,
+        "height_mm": 42,
+        "region_id": "REG-015",
+        "widget_ids": [
+          "WGT-039"
+        ],
+        "column_span": 4,
+        "grid_column": 5,
+        "region_order": 15,
+        "global_grid_row": 6,
+        "presentation_mode": "selected_kpi_grouped_bars",
+        "presentation_notes": "Eleven KPI categories with cumulative planned versus actual quantities to the data date. Categories remain in source-supplied order. No common KPI measurement unit is supplied, so no aggregation, normalisation or unit conversion is performed. Supplied zeros remain zero. Labels are reproduced from source."
+      },
+      {
+        "band": "bottom",
+        "title": "Weekly KPI Quantities",
+        "grid_row": 1,
+        "row_span": 1,
+        "height_mm": 42,
+        "region_id": "REG-016",
+        "widget_ids": [
+          "WGT-040"
+        ],
+        "column_span": 4,
+        "grid_column": 9,
+        "region_order": 16,
+        "global_grid_row": 6,
+        "presentation_mode": "selected_kpi_grouped_bars",
+        "presentation_notes": "Eleven KPI categories for current week 54 with weekly planned versus actual quantities. No common measurement unit is supplied, so no portfolio total, cross-KPI aggregation or unit conversion is performed. Supplied zeros are preserved. KPI labels are reproduced verbatim from source."
+      },
+      {
+        "band": "bottom",
+        "title": "Payment Status",
+        "grid_row": 2,
+        "row_span": 1,
+        "height_mm": 42,
+        "region_id": "REG-017",
+        "widget_ids": [
+          "WGT-042"
+        ],
+        "column_span": 4,
+        "grid_column": 1,
+        "region_order": 17,
+        "global_grid_row": 7,
+        "presentation_mode": "compact_financial_status_table",
+        "presentation_notes": "Compact single-record payment register table. Amounts are displayed exactly as supplied with no assumed currency because currency and currency-unit are null. No paid, outstanding, overdue or exposure values are derived. Payment date and record-created date are preserved. The record is presented as a stored register entry and is not validated as an as-of-data-date snapshot."
+      },
+      {
+        "band": "bottom",
+        "title": "Variation Status",
+        "grid_row": 2,
+        "row_span": 1,
+        "height_mm": 42,
+        "region_id": "REG-018",
+        "widget_ids": [
+          "WGT-043"
+        ],
+        "column_span": 5,
+        "grid_column": 5,
+        "region_order": 18,
+        "global_grid_row": 7,
+        "presentation_mode": "compact_financial_status_table",
+        "presentation_notes": "Compact single-record variation register. Status code 1 is preserved without an invented status label. Currency is null and supplied monetary amounts are shown as supplied zeros. No balances, entitlements or exposure are derived. Supplied record dates of 2026-10-01 postdate the 2026-09-27 data date and remain qualified. Submitted date and submitted value are unavailable."
+      },
+      {
+        "band": "bottom",
+        "title": "Progress Photographs",
+        "grid_row": 2,
+        "row_span": 1,
+        "height_mm": 42,
+        "region_id": "REG-019",
+        "widget_ids": [
+          "WGT-044"
+        ],
+        "column_span": 3,
+        "grid_column": 10,
+        "region_order": 19,
+        "global_grid_row": 7,
+        "presentation_mode": "progress_photo_gallery",
+        "presentation_notes": "Display one authoritative progress photograph supplied for week 54. The maximum of four is respected. No duplicate, unused gallery slots or invented captions. Trade, location and caption metadata are unavailable and must be shown as Not available."
+      },
+      {
+        "band": "footer",
+        "title": "Report Footer",
+        "grid_row": 1,
+        "row_span": 1,
+        "height_mm": 8,
+        "region_id": "REG-020",
+        "widget_ids": [],
+        "column_span": 12,
+        "grid_column": 1,
+        "region_order": 20,
+        "global_grid_row": 8,
+        "presentation_mode": "footer_metadata",
+        "presentation_notes": "Show project ID PRJ-ATGC-01, Data Date 27-Sep-2026, Report ID 3890b37e-3f16-418b-827e-1bdb93171844, design version 1.1 and A3 layout profile v3.4. Keep footer compact."
+      }
+    ],
+    "layout_profile": "executive_flexible_width_fixed_height_v3_4"
+  },
+  "document_type": "a3_executive_dashboard",
+  "layout_version": "3.4",
+  "dashboard_context": {
+    "schema": "public",
+    "week_num": 54,
+    "data_date": "2026-09-27",
+    "design_id": "93f5b361-6cda-47a3-a8e9-cae547c3c4f2",
+    "report_id": "3890b37e-3f16-418b-827e-1bdb93171844",
+    "project_id": "PRJ-ATGC-01",
+    "report_type": "Weekly Progress Report",
+    "structure_id": "3ddb08fd-5ac7-478e-85da-f0ad7bc58ada",
+    "design_version": "1.1",
+    "dashboard_title": "Construction Project Controls Dashboard",
+    "structure_version": "1.6"
+  },
+  "planning_metadata": {
+    "target_pages": 1,
+    "layout_profile": "executive_flexible_width_fixed_height_v3_4",
+    "sanitizer_version": "3.4",
+    "omitted_widget_ids": [],
+    "selected_widget_ids": [
+      "WGT-002",
+      "WGT-003",
+      "WGT-008",
+      "WGT-009",
+      "WGT-010",
+      "WGT-013",
+      "WGT-014",
+      "WGT-017",
+      "WGT-026",
+      "WGT-028",
+      "WGT-022",
+      "WGT-023",
+      "WGT-024",
+      "WGT-033",
+      "WGT-039",
+      "WGT-040",
+      "WGT-042",
+      "WGT-043",
+      "WGT-044"
+    ],
+    "sanitizer_validation": "passed",
+    "expected_region_count": 20,
+    "expected_widget_count": 19,
+    "layout_qualifications": [
+      "WGT-017 Widget AST was not supplied; the region is retained with an explicit unavailable-data state. No critical/driving classifications, activities, float values or dates were invented.",
+      "WGT-014 selection is limited to eight authoritative trades from the 29 supplied trade records. Actual finish dates for in-progress trades are latest verified activity actual finishes, not overall trade completion; no forecast trade finish dates were supplied or inferred.",
+      "WGT-044 contains one authoritative progress photograph; only that photo is displayed, and the gallery does not create unused slots or duplicate images.",
+      "WGT-042 has one payment record with null currency and currency-unit; no currency is assumed and no unpaid balance, overdue amount or exposure is derived.",
+      "WGT-043 has one variation record with null currency and unmapped status code 1; source values are preserved and record dates postdating the 2026-09-27 data date remain qualified.",
+      "WGT-002 previous-week cumulative planned comparison is unavailable because the baseline planned series has no 24-Sep-2026 observation; the current actual reporting period is a partial 3-day period.",
+      "WGT-009 and WGT-010 preserve independent datasets and captions within the combined region; the current W54 period is partial and baseline/reporting week numbering is not treated as coincident.",
+      "WGT-033 actual manpower is missing for 64 periods and remains a gap, not zero; W54 covers 2 working days.",
+      "WGT-039 and WGT-040 have no common KPI measurement units; no aggregation, normalisation or unit conversion is performed.",
+      "WGT-022, WGT-023 and WGT-024 preserve supplied status codes, zero-count categories and unclassified-record qualifications; shares are not computed over totals that include unstatused records.",
+      "WGT-026 preserves cumulative submission definitions and source scope exclusions; flat segments are not unavailable data.",
+      "WGT-028 preserves supplied OPN/CLS counts; disciplines with fewer recorded statuses than total documents are not zero-filled.",
+      "dashboard_context does not supply a project name; the header uses project ID and title only and does not invent a project name.",
+      "Print-fit has not been physically verified. The renderer must validate the one-page A3 landscape fit using the supplied fixed row heights, 12 mm margins and print configuration.",
+      "Supplied WGT-045 and WGT-048 are outside the approved 19-widget A3 dashboard scope and are not included; WGT-007 is excluded by specification."
+    ],
+    "non_widget_region_ids": [
+      "REG-001",
+      "REG-020"
+    ],
+    "selected_widget_count": 19,
+    "normalized_region_count": 20
+  }
+}

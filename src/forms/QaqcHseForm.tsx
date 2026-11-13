@@ -1,0 +1,1042 @@
+import { useState, useEffect } from 'react'
+import { useForm } from 'react-hook-form'
+import { schemaClient } from '@/lib/supabase'
+import type { QaqcHse, Discipline, Type } from '@/types/database'
+import { Modal } from '@/components/Modal'
+import { Pagination } from '@/components/Pagination'
+import { SearchFilter } from '@/components/SearchFilter'
+import { LoadingSpinner } from '@/components/LoadingSpinner'
+import { FormField } from '@/components/FormField'
+import { Notification } from '@/components/Notification'
+import { useNotification } from '@/hooks/useNotification'
+import { ColumnFilter } from '@/components/ColumnFilter'
+import { DateColumnFilter } from '@/components/DateColumnFilter'
+import { ConfirmDialog } from '@/components/ConfirmDialog'
+import { CsvControls } from '@/components/CsvControls'
+import { exportToCsv } from '@/utils/csv'
+
+interface QaqcHseFormData {
+  dgt_docid: string
+  dgt_docref: string
+  dgt_documentsubject: string
+  dgt_discipline: string
+  dgt_documenttype: string
+  dgt_submissiondate: string
+  dgt_responsedate: string
+  dgt_revision: string
+  dgt_status: string
+}
+
+const ITEMS_PER_PAGE = 15
+
+type EditableField = 'dgt_status' | 'mod_id'
+
+type EditingCell = {
+  recordId: string
+  field: EditableField
+} | null
+
+type SortField = 'dgt_docid' | 'dgt_docref' | 'dgt_documentsubject' | 'dgt_discipline' | 'dgt_documenttype' | 'dgt_submissiondate' | 'dgt_responsedate' | 'dgt_date_issued_to_contractor' | 'dgt_status' | 'week_num'
+type SortDirection = 'asc' | 'desc'
+
+export function QaqcHseForm({ projectId, projectTextId, schemaName }: { projectId: string; projectTextId: string; schemaName: string }) {
+  const supabase = schemaClient(schemaName)
+  const [data, setData] = useState<QaqcHse[]>([])
+  const [filterData, setFilterData] = useState<Pick<QaqcHse, 'dgt_docid' | 'dgt_docref' | 'dgt_discipline' | 'dgt_documenttype' | 'dgt_submissiondate' | 'dgt_responsedate' | 'dgt_date_issued_to_contractor' | 'dgt_status' | 'week_num' | 'mod_id'>[]>([])
+  const [totalCount, setTotalCount] = useState(0)
+  const [loading, setLoading] = useState(true)
+  const [isModalOpen, setIsModalOpen] = useState(false)
+  const [searchTerm, setSearchTerm] = useState('')
+  const [debouncedSearch, setDebouncedSearch] = useState('')
+  const [currentPage, setCurrentPage] = useState(1)
+  const [saving, setSaving] = useState(false)
+  const [editingCell, setEditingCell] = useState<EditingCell>(null)
+  const [cellValue, setCellValue] = useState('')
+  const [sortField, setSortField] = useState<SortField | null>(null)
+  const [sortDirection, setSortDirection] = useState<SortDirection>('asc')
+  const [deleteConfirm, setDeleteConfirm] = useState<string | null>(null)
+  const [deleting, setDeleting] = useState(false)
+  const [showDiscardConfirm, setShowDiscardConfirm] = useState(false)
+  const [disciplines, setDisciplines] = useState<Discipline[]>([])
+  const [showDisciplineLegend, setShowDisciplineLegend] = useState(false)
+  const [types, setTypes] = useState<Type[]>([])
+  const [showTypeLegend, setShowTypeLegend] = useState(false)
+  // Column filters
+  const [filters, setFilters] = useState({
+    dgt_docid: '',
+    dgt_docref: '',
+    dgt_discipline: '',
+    dgt_documenttype: '',
+    dgt_submissiondate: '',
+    dgt_responsedate: '',
+    dgt_date_issued_to_contractor: '',
+    dgt_status: '',
+    week_num: '',
+    mod_id: '',
+  })
+  const [webhookStatus, setWebhookStatus] = useState<'idle' | 'loading' | 'success' | 'error'>('idle')
+  const { notification, hideNotification, showSuccess, showError } = useNotification()
+
+  const triggerWebhook51 = async () => {
+    setWebhookStatus('loading')
+    try {
+      const params = new URLSearchParams({ project_id: projectTextId, schema: schemaName })
+      await fetch(`https://pmc2p2c.app.n8n.cloud/webhook/70203aa4-fa3c-4a68-a9c4-5454b3ea8dec?${params}`, { method: 'GET' })
+      setWebhookStatus('success')
+    } catch {
+      setWebhookStatus('error')
+    }
+  }
+
+  const updateFilter = (field: keyof typeof filters, value: string) => {
+    setFilters(prev => ({ ...prev, [field]: value }))
+    setCurrentPage(1)
+  }
+
+  const {
+    register,
+    handleSubmit,
+    reset,
+    formState: { errors, isDirty },
+  } = useForm<QaqcHseFormData>()
+
+  const handleCancelModal = () => {
+    if (isDirty) {
+      setShowDiscardConfirm(true)
+    } else {
+      setIsModalOpen(false)
+    }
+  }
+
+  const fetchFilterOptions = async () => {
+    if (!projectId) return
+    const { data: rows } = await supabase
+      .from('dbp6_000402_qaqc_hse_current')
+      .select('dgt_docid,dgt_docref,dgt_discipline,dgt_documenttype,dgt_submissiondate,dgt_responsedate,dgt_date_issued_to_contractor,dgt_status,week_num,mod_id')
+      .eq('dgt_dbp6bd00projectdataid', projectId)
+    setFilterData((rows as typeof filterData | null) ?? [])
+  }
+
+  const fetchData = async () => {
+    if (!projectId) return
+    setLoading(true)
+    const from = (currentPage - 1) * ITEMS_PER_PAGE
+    const to = from + ITEMS_PER_PAGE - 1
+    let query = supabase
+      .from('dbp6_000402_qaqc_hse_current')
+      .select('*', { count: 'exact' })
+      .eq('dgt_dbp6bd00projectdataid', projectId)
+      .order(sortField ?? 'dgt_docref', { ascending: sortDirection === 'asc' })
+      .range(from, to)
+    if (debouncedSearch) {
+      query = query.or(`dgt_docid.ilike.%${debouncedSearch}%,dgt_docref.ilike.%${debouncedSearch}%,dgt_documentsubject.ilike.%${debouncedSearch}%`)
+    }
+    if (filters.dgt_docid) {
+      if (filters.dgt_docid === 'BLANK') { query = query.is('dgt_docid', null) }
+      else { query = query.eq('dgt_docid', filters.dgt_docid) }
+    }
+    if (filters.dgt_docref) {
+      if (filters.dgt_docref === 'BLANK') { query = query.is('dgt_docref', null) }
+      else { query = query.eq('dgt_docref', filters.dgt_docref) }
+    }
+    if (filters.dgt_discipline) {
+      if (filters.dgt_discipline === 'BLANK') { query = query.is('dgt_discipline', null) }
+      else { query = query.eq('dgt_discipline', filters.dgt_discipline) }
+    }
+    if (filters.dgt_documenttype) {
+      if (filters.dgt_documenttype === 'BLANK') { query = query.is('dgt_documenttype', null) }
+      else { query = query.eq('dgt_documenttype', filters.dgt_documenttype) }
+    }
+    if (filters.dgt_submissiondate) {
+      if (filters.dgt_submissiondate === 'BLANK') { query = query.is('dgt_submissiondate', null) }
+      else {
+        const [y, m] = filters.dgt_submissiondate.split('-')
+        const start = `${y}-${m}-01`
+        const nextMonth = parseInt(m) === 12 ? `${parseInt(y)+1}-01-01` : `${y}-${String(parseInt(m)+1).padStart(2,'0')}-01`
+        query = query.gte('dgt_submissiondate', start).lt('dgt_submissiondate', nextMonth)
+      }
+    }
+    if (filters.dgt_responsedate) {
+      if (filters.dgt_responsedate === 'BLANK') { query = query.is('dgt_responsedate', null) }
+      else {
+        const [y, m] = filters.dgt_responsedate.split('-')
+        const start = `${y}-${m}-01`
+        const nextMonth = parseInt(m) === 12 ? `${parseInt(y)+1}-01-01` : `${y}-${String(parseInt(m)+1).padStart(2,'0')}-01`
+        query = query.gte('dgt_responsedate', start).lt('dgt_responsedate', nextMonth)
+      }
+    }
+    if (filters.dgt_date_issued_to_contractor) {
+      if (filters.dgt_date_issued_to_contractor === 'BLANK') { query = query.is('dgt_date_issued_to_contractor', null) }
+      else {
+        const [y, m] = filters.dgt_date_issued_to_contractor.split('-')
+        const start = `${y}-${m}-01`
+        const nextMonth = parseInt(m) === 12 ? `${parseInt(y)+1}-01-01` : `${y}-${String(parseInt(m)+1).padStart(2,'0')}-01`
+        query = query.gte('dgt_date_issued_to_contractor', start).lt('dgt_date_issued_to_contractor', nextMonth)
+      }
+    }
+    if (filters.dgt_status) query = query.eq('dgt_status', filters.dgt_status)
+    if (filters.week_num) query = query.eq('week_num', filters.week_num)
+    if (filters.mod_id) query = query.eq('mod_id', filters.mod_id)
+    const { data: records, count, error } = await query
+    if (error) { showError('Failed to fetch data: ' + error.message) }
+    else { setData((records as QaqcHse[] | null) ?? []); setTotalCount(count ?? 0) }
+    setLoading(false)
+  }
+
+  const fetchDisciplines = async () => {
+    const { data: records } = await supabase.from('dbp6_0018_discipline').select('id, discipline_code, discipline_name').order('discipline_code', { ascending: true })
+    setDisciplines(records || [])
+  }
+
+  const fetchTypes = async () => {
+    const { data: records } = await supabase.from('dbp6_0019_type').select('id, type_code, type_name').order('type_code', { ascending: true })
+    setTypes(records || [])
+  }
+
+  useEffect(() => {
+    fetchFilterOptions()
+    fetchDisciplines()
+    fetchTypes()
+  }, [projectId])
+  useEffect(() => {
+    const t = setTimeout(() => setDebouncedSearch(searchTerm), 300)
+    return () => clearTimeout(t)
+  }, [searchTerm])
+  useEffect(() => { setCurrentPage(1) }, [debouncedSearch])
+  useEffect(() => { fetchData() }, [projectId, schemaName, currentPage, debouncedSearch, filters, sortField, sortDirection])
+
+  const handleSort = (field: SortField) => {
+    if (sortField === field) {
+      setSortDirection(sortDirection === 'asc' ? 'desc' : 'asc')
+    } else {
+      setSortField(field)
+      setSortDirection('asc')
+    }
+  }
+
+  const SortIcon = ({ field }: { field: SortField }) => {
+    if (sortField !== field) {
+      return (
+        <svg className="w-4 h-4 text-gray-400" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+          <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M7 16V4m0 0L3 8m4-4l4 4m6 0v12m0 0l4-4m-4 4l-4-4" />
+        </svg>
+      )
+    }
+    return sortDirection === 'asc' ? (
+      <svg className="w-4 h-4 text-blue-600" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+        <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M5 15l7-7 7 7" />
+      </svg>
+    ) : (
+      <svg className="w-4 h-4 text-blue-600" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+        <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 9l-7 7-7-7" />
+      </svg>
+    )
+  }
+
+  const getDisciplineName = (code: string | null) => {
+    if (code == null) return '-'
+    return disciplines.find(d => d.discipline_code?.toString() === code)?.discipline_name || `Code: ${code}`
+  }
+
+  const getDocTypeName = (code: string | null) => {
+    if (!code) return '-'
+    return types.find(t => t.type_code?.toString() === code)?.type_name || code
+  }
+
+  const totalPages = Math.max(1, Math.ceil(totalCount / ITEMS_PER_PAGE))
+
+  const openCreateModal = () => {
+    reset({
+      dgt_docid: '',
+      dgt_docref: '',
+      dgt_documentsubject: '',
+      dgt_discipline: '',
+      dgt_documenttype: '',
+      dgt_submissiondate: '',
+      dgt_responsedate: '',
+      dgt_revision: '',
+      dgt_status: '',
+    })
+    setIsModalOpen(true)
+  }
+
+  const onSubmit = async (formData: QaqcHseFormData) => {
+    setSaving(true)
+
+    const insertData = {
+      dgt_dbp6bd00projectdataid: projectId,
+      dgt_docid: formData.dgt_docid || null,
+      dgt_docref: formData.dgt_docref || null,
+      dgt_documentsubject: formData.dgt_documentsubject || null,
+      dgt_discipline: formData.dgt_discipline || null,
+      dgt_documenttype: formData.dgt_documenttype || null,
+      dgt_submissiondate: formData.dgt_submissiondate || null,
+      dgt_responsedate: formData.dgt_responsedate || null,
+      dgt_revision: formData.dgt_revision ? parseInt(formData.dgt_revision) : null,
+      dgt_status: formData.dgt_status || null,
+    }
+
+    const { error } = await supabase.from('dbp6_000402_qaqc_hse_current').insert(insertData as never)
+
+    if (error) {
+      showError('Failed to create record: ' + error.message)
+    } else {
+      showSuccess('Record created successfully')
+      setIsModalOpen(false)
+      fetchData()
+    }
+
+    setSaving(false)
+  }
+
+  const startEditing = (
+    recordId: string,
+    field: EditableField,
+    currentValue: string | null
+  ) => {
+    setEditingCell({ recordId, field })
+    setCellValue(currentValue || '')
+  }
+
+  const cancelEditing = () => {
+    setEditingCell(null)
+    setCellValue('')
+  }
+
+  const saveInlineEdit = async (recordId: string, field: EditableField) => {
+    const isNumeric = field === 'mod_id'
+    const updateValue = isNumeric
+      ? (cellValue !== '' ? parseInt(cellValue) : null)
+      : (cellValue || null)
+    const updatePayload: Record<string, string | number | null> = { [field]: updateValue }
+
+    const { error } = await supabase
+      .from('dbp6_000402_qaqc_hse_current')
+      .update(updatePayload as never)
+      .eq('dgt_dbp6bd0402qaqchseid', recordId)
+
+    if (error) {
+      showError('Failed to update: ' + error.message)
+    } else {
+      setData((prev) =>
+        prev.map((item) =>
+          item.dgt_dbp6bd0402qaqchseid === recordId
+            ? { ...item, [field]: updateValue }
+            : item
+        )
+      )
+      showSuccess('Updated successfully')
+    }
+    setEditingCell(null)
+    setCellValue('')
+  }
+
+  const handleKeyDown = (e: React.KeyboardEvent, recordId: string, field: EditableField) => {
+    if (e.key === 'Enter') {
+      saveInlineEdit(recordId, field)
+    } else if (e.key === 'Escape') {
+      cancelEditing()
+    }
+  }
+
+  const handleDelete = async (recordId: string) => {
+    setDeleting(true)
+    const { error } = await supabase
+      .from('dbp6_000402_qaqc_hse_current')
+      .delete()
+      .eq('dgt_dbp6bd0402qaqchseid', recordId)
+
+    if (error) {
+      showError('Failed to delete record: ' + error.message)
+    } else {
+      showSuccess('Record deleted successfully')
+      fetchData(); fetchFilterOptions()
+    }
+    setDeleting(false)
+    setDeleteConfirm(null)
+  }
+
+  const handleExport = async () => {
+    const db = schemaClient(schemaName)
+    const pageSize = 1000
+    let page = 0
+    const all: QaqcHse[] = []
+    while (true) {
+      const { data: records, error } = await db
+        .from('dbp6_000402_qaqc_hse_current')
+        .select('*')
+        .eq('dgt_dbp6bd00projectdataid', projectId)
+        .order('dgt_docref', { ascending: true })
+        .range(page * pageSize, (page + 1) * pageSize - 1)
+      if (error) { showError('Export failed: ' + error.message); return }
+      all.push(...(records || []))
+      if (!records || records.length < pageSize) break
+      page++
+    }
+    const headers = [
+      'dgt_discipline',
+      'dgt_docref',
+      'dgt_documentsubject',
+      'dgt_documenttype',
+      'dgt_revision',
+      'dgt_status',
+      'dgt_submissiondate',
+      'dgt_responsedate',
+      'dgt_date_issued_to_contractor',
+      'week_num',
+      'dgt_projectid',
+    ]
+    const rows = all.map(r => [
+      r.dgt_discipline,
+      r.dgt_docref,
+      r.dgt_documentsubject,
+      r.dgt_documenttype,
+      r.dgt_revision,
+      r.dgt_status,
+      r.dgt_submissiondate,
+      r.dgt_responsedate,
+      r.dgt_date_issued_to_contractor,
+      r.week_num,
+      r.dgt_dbp6bd00projectdataid,
+    ])
+    exportToCsv('qaqc-hse', headers, rows)
+  }
+
+  const handleImport = async (rows: Record<string, string>[]) => {
+    if (rows.length === 0) { showError('No data found in CSV'); return }
+
+    const parseDate = (v: string | undefined): string | null => {
+      if (!v || v.trim() === '') return null
+      const d = new Date(v.trim())
+      return isNaN(d.getTime()) ? null : d.toISOString().split('T')[0]
+    }
+    const nullIfEmpty = (v: string | undefined): string | null => (!v || v.trim() === '' ? null : v.trim())
+
+    // Parse and filter rows with a docref
+    const parsed = rows
+      .filter(r => r.dgt_docref && r.dgt_docref.trim() !== '')
+      .map(r => ({
+        dgt_dbp6bd00projectdataid: projectId,
+        dgt_discipline: nullIfEmpty(r.dgt_discipline),
+        dgt_docref: r.dgt_docref.trim(),
+        dgt_documentsubject: nullIfEmpty(r.dgt_documentsubject),
+        dgt_documenttype: nullIfEmpty(r.dgt_documenttype),
+        dgt_revision: r.dgt_revision && r.dgt_revision.trim() !== '' ? parseInt(r.dgt_revision.trim()) : null,
+        dgt_status: nullIfEmpty(r.dgt_status),
+        dgt_submissiondate: parseDate(r.dgt_submissiondate),
+        dgt_responsedate: parseDate(r.dgt_responsedate),
+        dgt_date_issued_to_contractor: parseDate(r.dgt_date_issued_to_contractor),
+        week_num: r.week_num && r.week_num.trim() !== '' ? parseInt(r.week_num.trim()) : null,
+        mod_id: 1,
+      }))
+
+    if (parsed.length === 0) { showError('No valid rows to import'); return }
+
+    // Deduplicate: keep highest dgt_revision per dgt_docref
+    const dedupMap = new Map<string, typeof parsed[number]>()
+    for (const row of parsed) {
+      const existing = dedupMap.get(row.dgt_docref)
+      if (!existing || (row.dgt_revision ?? -Infinity) > (existing.dgt_revision ?? -Infinity)) {
+        dedupMap.set(row.dgt_docref, row)
+      }
+    }
+    const deduped = Array.from(dedupMap.values())
+
+    // Fetch existing docrefs to distinguish updates vs inserts
+    const db = schemaClient(schemaName)
+    const { data: existing, error: fetchErr } = await db
+      .from('dbp6_000402_qaqc_hse_current')
+      .select('dgt_docref')
+      .eq('dgt_dbp6bd00projectdataid', projectId)
+    if (fetchErr) { showError('Import failed: ' + fetchErr.message); return }
+
+    const existingRefs = new Set((existing || []).map((r: { dgt_docref: string | null }) => r.dgt_docref))
+    const toUpdate = deduped.filter(r => existingRefs.has(r.dgt_docref))
+    const toInsert = deduped.filter(r => !existingRefs.has(r.dgt_docref))
+
+    // Upsert into _current on conflict dgt_docref
+    const { error: upsertErr } = await db
+      .from('dbp6_000402_qaqc_hse_current')
+      .upsert(deduped as never[], { onConflict: 'dgt_docref' })
+    if (upsertErr) { showError('Import failed: ' + upsertErr.message); return }
+
+    // Sync to _history on conflict (dgt_docref, dgt_revision)
+    const historyRows = deduped.map(r => ({ ...r }))
+    const { error: histErr } = await db
+      .from('dbp6_000402_qaqc_hse_history')
+      .upsert(historyRows as never[], { onConflict: 'dgt_docref,dgt_revision' })
+    if (histErr) { showError(`Current updated but history sync failed: ${histErr.message}`); fetchData(); return }
+
+    showSuccess(`${toUpdate.length} updated, ${toInsert.length} inserted`)
+    fetchData()
+  }
+
+  const formatDate = (dateString: string | null) => {
+    if (!dateString) return '-'
+    return new Date(dateString).toLocaleDateString()
+  }
+
+  return (
+    <div className="space-y-4">
+      {notification && (
+        <Notification
+          type={notification.type}
+          message={notification.message}
+          onClose={hideNotification}
+        />
+      )}
+
+      <div className="flex flex-col sm:flex-row justify-between gap-4">
+        <div className="flex items-center gap-2 flex-wrap">
+          <div className="w-full sm:w-72">
+            <SearchFilter
+              value={searchTerm}
+              onChange={setSearchTerm}
+              placeholder="Search by Doc ID, Ref, Subject..."
+            />
+          </div>
+          {(Object.values(filters).some(v => v !== '') || sortField !== null) && (
+            <button
+              onClick={() => {
+                setFilters({
+                  dgt_docid: '',
+                  dgt_docref: '',
+                  dgt_discipline: '',
+                  dgt_documenttype: '',
+                  dgt_submissiondate: '',
+                  dgt_responsedate: '',
+                  dgt_date_issued_to_contractor: '',
+                  dgt_status: '',
+                  week_num: '',
+                  mod_id: '',
+                })
+                setSortField(null)
+                setSortDirection('asc')
+              }}
+              className="inline-flex items-center px-3 py-2 text-sm font-medium text-white bg-red-600 border border-red-600 rounded-md hover:bg-red-700 transition-colors whitespace-nowrap shadow-sm"
+              title="Clear all filters and sorting"
+            >
+              <svg className="w-4 h-4 mr-1.5" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+                <path strokeLinecap="round" strokeLinejoin="round" d="M6 18L18 6M6 6l12 12" />
+              </svg>
+              Clear All
+              <span className="ml-1.5 px-1.5 py-0.5 text-xs bg-red-800 rounded">
+                {Object.values(filters).filter(v => v !== '').length + (sortField !== null ? 1 : 0)}
+              </span>
+            </button>
+          )}
+          <button
+            onClick={() => setShowDisciplineLegend(!showDisciplineLegend)}
+            className="inline-flex items-center px-3 py-2 text-sm font-medium text-gray-700 bg-white border border-gray-300 rounded-md hover:bg-gray-50 transition-colors whitespace-nowrap shadow-sm"
+            title="Show discipline code reference"
+          >
+            <svg className="w-4 h-4 mr-1.5" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+              <path strokeLinecap="round" strokeLinejoin="round" d="M13 16h-1v-4h-1m1-4h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z" />
+            </svg>
+            Discipline Legend
+          </button>
+          <button
+            onClick={() => setShowTypeLegend(!showTypeLegend)}
+            className="inline-flex items-center px-3 py-2 text-sm font-medium text-gray-700 bg-white border border-gray-300 rounded-md hover:bg-gray-50 transition-colors whitespace-nowrap shadow-sm"
+            title="Show type code reference"
+          >
+            <svg className="w-4 h-4 mr-1.5" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+              <path strokeLinecap="round" strokeLinejoin="round" d="M13 16h-1v-4h-1m1-4h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z" />
+            </svg>
+            Type Legend
+          </button>
+        </div>
+        <div className="flex items-center gap-2">
+          <CsvControls onExport={handleExport} onImport={handleImport} />
+          <button
+            onClick={triggerWebhook51}
+            disabled={webhookStatus === 'loading'}
+            className={`inline-flex items-center px-4 py-2 border border-transparent text-sm font-medium rounded-md shadow-sm text-white focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-blue-500 transition-colors ${
+              webhookStatus === 'success' ? 'bg-green-600 hover:bg-green-700' :
+              webhookStatus === 'error' ? 'bg-red-600 hover:bg-red-700' :
+              'bg-indigo-600 hover:bg-indigo-700'
+            } disabled:opacity-60`}
+          >
+            {webhookStatus === 'loading' ? (
+              <>
+                <svg className="animate-spin -ml-1 mr-2 h-4 w-4 text-white" fill="none" viewBox="0 0 24 24">
+                  <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" />
+                  <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z" />
+                </svg>
+                Posting...
+              </>
+            ) : webhookStatus === 'success' ? (
+              <>
+                <svg className="w-4 h-4 mr-2" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2.5} d="M5 13l4 4L19 7" />
+                </svg>
+                Posted!
+              </>
+            ) : webhookStatus === 'error' ? (
+              <>
+                <svg className="w-4 h-4 mr-2" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2.5} d="M6 18L18 6M6 6l12 12" />
+                </svg>
+                Failed
+              </>
+            ) : (
+              'Post Update'
+            )}
+          </button>
+          <button
+            onClick={openCreateModal}
+            className="inline-flex items-center px-4 py-2 border border-transparent text-sm font-medium rounded-md shadow-sm text-white bg-blue-600 hover:bg-blue-700 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-blue-500"
+          >
+            <svg className="w-5 h-5 mr-2" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 4v16m8-8H4" />
+            </svg>
+            Create New
+          </button>
+        </div>
+      </div>
+
+      {showDisciplineLegend && disciplines.length > 0 && (
+        <div className="bg-green-50 border border-green-200 rounded-lg p-4">
+          <h3 className="text-sm font-semibold text-gray-900 mb-2">Discipline Reference</h3>
+          <div className="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-4 lg:grid-cols-5 gap-2">
+            {disciplines.map((d) => (
+              <div key={d.id} className="flex items-center gap-2 text-sm">
+                <span className="font-mono font-semibold text-green-700 bg-green-100 px-2 py-1 rounded">
+                  {d.discipline_code}
+                </span>
+                <span className="text-gray-700">{d.discipline_name}</span>
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
+      {showDisciplineLegend && disciplines.length === 0 && (
+        <div className="bg-yellow-50 border border-yellow-200 rounded-lg p-4">
+          <p className="text-sm text-yellow-800">No disciplines found. Please add disciplines to the discipline table.</p>
+        </div>
+      )}
+
+      {showTypeLegend && types.length > 0 && (
+        <div className="bg-blue-50 border border-blue-200 rounded-lg p-4">
+          <h3 className="text-sm font-semibold text-gray-900 mb-2">Type Reference</h3>
+          <div className="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-4 lg:grid-cols-5 gap-2">
+            {types.map((t) => (
+              <div key={t.id} className="flex items-center gap-2 text-sm">
+                <span className="font-mono font-semibold text-blue-700 bg-blue-100 px-2 py-1 rounded">
+                  {t.type_code}
+                </span>
+                <span className="text-gray-700">{t.type_name}</span>
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
+      {showTypeLegend && types.length === 0 && (
+        <div className="bg-yellow-50 border border-yellow-200 rounded-lg p-4">
+          <p className="text-sm text-yellow-800">No types found. Please add types to the type table.</p>
+        </div>
+      )}
+
+      {loading ? (
+        <LoadingSpinner />
+      ) : (
+        <div className="bg-white shadow rounded-lg overflow-hidden">
+          {/* Results count */}
+          <div className="px-4 py-2 bg-gray-50 border-b border-gray-200">
+            <span className="text-sm text-gray-600">
+              Showing <span className="font-semibold text-gray-900">{totalCount}</span> record{totalCount !== 1 ? 's' : ''}
+              {(Object.values(filters).some(v => v !== '') || searchTerm) && (
+                <span className="ml-1 text-gray-500">
+                  (filtered from {data.length} total)
+                </span>
+              )}
+            </span>
+          </div>
+          <div className="overflow-auto max-h-[600px]">
+            <table className="min-w-max w-full divide-y divide-gray-200">
+              <thead className="bg-gray-50 sticky top-0 z-10">
+                <tr className="border-b border-gray-200">
+                  <th className="px-3 py-2 text-left align-top w-28">
+                    <div
+                      className="flex items-center gap-1 text-xs font-medium text-gray-600 uppercase tracking-wide cursor-pointer hover:text-gray-800 whitespace-nowrap"
+                      onClick={() => handleSort('dgt_docid')}
+                    >
+                      Doc ID
+                      <SortIcon field="dgt_docid" />
+                    </div>
+                    <div className="mt-1.5" onClick={(e) => e.stopPropagation()}>
+                      <ColumnFilter data={filterData} field="dgt_docid" value={filters.dgt_docid} onChange={(v) => updateFilter('dgt_docid', v)} label="Doc ID" />
+                    </div>
+                  </th>
+                  <th className="px-3 py-2 text-left align-top w-32">
+                    <div
+                      className="flex items-center gap-1 text-xs font-medium text-gray-600 uppercase tracking-wide cursor-pointer hover:text-gray-800 whitespace-nowrap"
+                      onClick={() => handleSort('dgt_docref')}
+                    >
+                      Doc Ref
+                      <SortIcon field="dgt_docref" />
+                    </div>
+                    <div className="mt-1.5" onClick={(e) => e.stopPropagation()}>
+                      <ColumnFilter data={filterData} field="dgt_docref" value={filters.dgt_docref} onChange={(v) => updateFilter('dgt_docref', v)} label="Doc Ref" />
+                    </div>
+                  </th>
+                  <th className="px-3 py-2 text-left align-top">
+                    <div
+                      className="flex items-center gap-1 text-xs font-medium text-gray-600 uppercase tracking-wide cursor-pointer hover:text-gray-800 whitespace-nowrap"
+                      onClick={() => handleSort('dgt_documentsubject')}
+                    >
+                      Subject
+                      <SortIcon field="dgt_documentsubject" />
+                    </div>
+                  </th>
+                  <th className="px-3 py-2 text-left align-top w-28">
+                    <div
+                      className="flex items-center gap-1 text-xs font-medium text-gray-600 uppercase tracking-wide cursor-pointer hover:text-gray-800 whitespace-nowrap"
+                      onClick={() => handleSort('dgt_discipline')}
+                    >
+                      Discipline
+                      <SortIcon field="dgt_discipline" />
+                    </div>
+                    <div className="mt-1.5" onClick={(e) => e.stopPropagation()}>
+                      <ColumnFilter data={filterData} field="dgt_discipline" value={filters.dgt_discipline} onChange={(v) => updateFilter('dgt_discipline', v)} label="Discipline" formatValue={(v) => getDisciplineName(v as string)} />
+                    </div>
+                  </th>
+                  <th className="px-3 py-2 text-left align-top w-32">
+                    <div
+                      className="flex items-center gap-1 text-xs font-medium text-gray-600 uppercase tracking-wide cursor-pointer hover:text-gray-800 whitespace-nowrap"
+                      onClick={() => handleSort('dgt_documenttype')}
+                    >
+                      Doc Type
+                      <SortIcon field="dgt_documenttype" />
+                    </div>
+                    <div className="mt-1.5" onClick={(e) => e.stopPropagation()}>
+                      <ColumnFilter data={filterData} field="dgt_documenttype" value={filters.dgt_documenttype} onChange={(v) => updateFilter('dgt_documenttype', v)} label="Doc Type" formatValue={(v) => getDocTypeName(v as string | null)} />
+                    </div>
+                  </th>
+                  <th className="px-3 py-2 text-left align-top w-32">
+                    <div
+                      className="flex items-center gap-1 text-xs font-medium text-gray-600 uppercase tracking-wide cursor-pointer hover:text-gray-800 whitespace-nowrap"
+                      onClick={() => handleSort('dgt_submissiondate')}
+                    >
+                      Submission
+                      <SortIcon field="dgt_submissiondate" />
+                    </div>
+                    <div className="mt-1.5" onClick={(e) => e.stopPropagation()}>
+                      <DateColumnFilter data={filterData} field="dgt_submissiondate" value={filters.dgt_submissiondate} onChange={(v) => updateFilter('dgt_submissiondate', v)} label="Submission" />
+                    </div>
+                  </th>
+                  <th className="px-3 py-2 text-left align-top w-32">
+                    <div
+                      className="flex items-center gap-1 text-xs font-medium text-gray-600 uppercase tracking-wide cursor-pointer hover:text-gray-800 whitespace-nowrap"
+                      onClick={() => handleSort('dgt_responsedate')}
+                    >
+                      Response
+                      <SortIcon field="dgt_responsedate" />
+                    </div>
+                    <div className="mt-1.5" onClick={(e) => e.stopPropagation()}>
+                      <DateColumnFilter data={filterData} field="dgt_responsedate" value={filters.dgt_responsedate} onChange={(v) => updateFilter('dgt_responsedate', v)} label="Response" />
+                    </div>
+                  </th>
+                  <th className="px-3 py-2 text-left align-top w-32">
+                    <div
+                      className="flex items-center gap-1 text-xs font-medium text-gray-600 uppercase tracking-wide cursor-pointer hover:text-gray-800 whitespace-nowrap"
+                      onClick={() => handleSort('dgt_date_issued_to_contractor')}
+                    >
+                      Issued to Contr.
+                      <SortIcon field="dgt_date_issued_to_contractor" />
+                    </div>
+                    <div className="mt-1.5" onClick={(e) => e.stopPropagation()}>
+                      <DateColumnFilter data={filterData} field="dgt_date_issued_to_contractor" value={filters.dgt_date_issued_to_contractor} onChange={(v) => updateFilter('dgt_date_issued_to_contractor', v)} label="Issued to Contr." />
+                    </div>
+                  </th>
+                  <th className="px-3 py-2 text-left align-top w-28">
+                    <div
+                      className="flex items-center gap-1 text-xs font-medium text-gray-600 uppercase tracking-wide cursor-pointer hover:text-gray-800 whitespace-nowrap"
+                      onClick={() => handleSort('dgt_status')}
+                    >
+                      Status
+                      <SortIcon field="dgt_status" />
+                    </div>
+                    <div className="mt-1.5" onClick={(e) => e.stopPropagation()}>
+                      <ColumnFilter data={filterData} field="dgt_status" value={filters.dgt_status} onChange={(v) => updateFilter('dgt_status', v)} label="Status" />
+                    </div>
+                  </th>
+                  <th className="px-3 py-2 text-left align-top w-20">
+                    <div
+                      className="flex items-center gap-1 text-xs font-medium text-gray-600 uppercase tracking-wide cursor-pointer hover:text-gray-800 whitespace-nowrap"
+                      onClick={() => handleSort('week_num')}
+                    >
+                      Week
+                      <SortIcon field="week_num" />
+                    </div>
+                    <div className="mt-1.5" onClick={(e) => e.stopPropagation()}>
+                      <ColumnFilter data={filterData} field="week_num" value={filters.week_num} onChange={(v) => updateFilter('week_num', v)} label="Week" />
+                    </div>
+                  </th>
+                  <th className="px-3 py-2 text-left align-top w-16">
+                    <div className="text-xs font-medium text-gray-600 uppercase tracking-wide whitespace-nowrap">Mod ID</div>
+                    <div className="mt-1.5" onClick={(e) => e.stopPropagation()}>
+                      <ColumnFilter data={filterData} field="mod_id" value={filters.mod_id} onChange={(v) => updateFilter('mod_id', v)} label="Mod ID" />
+                    </div>
+                  </th>
+                  <th className="px-3 py-2 text-left align-top text-xs font-medium text-gray-600 uppercase tracking-wide w-20">
+                    Actions
+                  </th>
+                </tr>
+              </thead>
+              <tbody className="bg-white divide-y divide-gray-200">
+                {data.length === 0 ? (
+                  <tr>
+                    <td colSpan={12} className="px-6 py-8 text-center text-gray-500">
+                      No records found
+                    </td>
+                  </tr>
+                ) : (
+                  data.map((record) => (
+                    <tr key={record.dgt_dbp6bd0402qaqchseid} className={record.mod_id === 1 ? 'bg-yellow-50 hover:bg-yellow-100' : 'hover:bg-gray-50'}>
+                      <td className="px-3 py-2.5 whitespace-nowrap text-sm text-gray-900">
+                        {record.dgt_docid || '-'}
+                      </td>
+                      <td className="px-3 py-2.5 whitespace-nowrap text-sm text-gray-900">
+                        {record.dgt_docref || '-'}
+                      </td>
+                      <td className="px-3 py-2.5 text-sm text-gray-900 max-w-xs break-words">
+                        {record.dgt_documentsubject || '-'}
+                      </td>
+                      <td className="px-3 py-2.5 whitespace-nowrap text-sm text-gray-900">
+                        {getDisciplineName(record.dgt_discipline)}
+                      </td>
+                      <td className="px-3 py-2.5 whitespace-nowrap text-sm text-gray-900">
+                        {getDocTypeName(record.dgt_documenttype)}
+                      </td>
+                      <td className="px-3 py-2.5 whitespace-nowrap text-sm text-gray-900">
+                        {formatDate(record.dgt_submissiondate)}
+                      </td>
+                      <td className="px-3 py-2.5 whitespace-nowrap text-sm text-gray-900">
+                        {formatDate(record.dgt_responsedate)}
+                      </td>
+                      <td className="px-3 py-2.5 whitespace-nowrap text-sm text-gray-900">
+                        {formatDate(record.dgt_date_issued_to_contractor)}
+                      </td>
+                      {/* Status - Editable */}
+                      <td className="px-3 py-2.5 whitespace-nowrap">
+                        {editingCell?.recordId === record.dgt_dbp6bd0402qaqchseid && editingCell?.field === 'dgt_status' ? (
+                          <select
+                            value={cellValue}
+                            onChange={(e) => setCellValue(e.target.value)}
+                            onBlur={() => saveInlineEdit(record.dgt_dbp6bd0402qaqchseid, 'dgt_status')}
+                            onKeyDown={(e) => handleKeyDown(e, record.dgt_dbp6bd0402qaqchseid, 'dgt_status')}
+                            className="w-20 px-1 py-1 text-xs border border-blue-500 rounded focus:outline-none focus:ring-1 focus:ring-blue-500"
+                            autoFocus
+                          >
+                            <option value="">-</option>
+                            <option value="OPN">OPN</option>
+                            <option value="CLS">CLS</option>
+                            <option value="REJ">REJ</option>
+                          </select>
+                        ) : (
+                          <span
+                            onClick={() => startEditing(record.dgt_dbp6bd0402qaqchseid, 'dgt_status', record.dgt_status)}
+                            className={`inline-flex px-2 py-1 text-xs font-semibold rounded-full cursor-pointer hover:opacity-80 ${
+                              record.dgt_status === 'OPN'
+                                ? 'bg-blue-100 text-blue-800'
+                                : record.dgt_status === 'CLS'
+                                ? 'bg-green-100 text-green-800'
+                                : record.dgt_status === 'REJ'
+                                ? 'bg-red-100 text-red-800'
+                                : 'bg-gray-100 text-gray-800'
+                            }`}
+                          >
+                            {record.dgt_status || '-'}
+                          </span>
+                        )}
+                      </td>
+                      {/* Week Num */}
+                      <td className="px-3 py-2.5 whitespace-nowrap text-sm text-gray-500">
+                        {record.week_num ?? '-'}
+                      </td>
+                      {/* Mod ID */}
+                      <td className="px-3 py-2.5 whitespace-nowrap">
+                        {editingCell?.recordId === record.dgt_dbp6bd0402qaqchseid && editingCell?.field === 'mod_id' ? (
+                          <input
+                            type="number"
+                            value={cellValue}
+                            onChange={(e) => setCellValue(e.target.value)}
+                            onBlur={() => saveInlineEdit(record.dgt_dbp6bd0402qaqchseid, 'mod_id')}
+                            onKeyDown={(e) => handleKeyDown(e, record.dgt_dbp6bd0402qaqchseid, 'mod_id')}
+                            className="w-16 px-1 py-1 text-xs border border-blue-500 rounded focus:outline-none focus:ring-1 focus:ring-blue-500"
+                            autoFocus
+                          />
+                        ) : (
+                          <span
+                            onClick={() => startEditing(record.dgt_dbp6bd0402qaqchseid, 'mod_id', record.mod_id != null ? String(record.mod_id) : '')}
+                            className="text-sm text-gray-500 cursor-pointer hover:text-blue-600"
+                          >
+                            {record.mod_id ?? '-'}
+                          </span>
+                        )}
+                      </td>
+                      {/* Actions */}
+                      <td className="px-3 py-2.5 whitespace-nowrap">
+                        <button
+                          onClick={() => setDeleteConfirm(record.dgt_dbp6bd0402qaqchseid)}
+                          className="p-1 text-red-500 rounded"
+                          title="Delete record"
+                        >
+                          <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                            <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16" />
+                          </svg>
+                        </button>
+                      </td>
+                    </tr>
+                  ))
+                )}
+              </tbody>
+            </table>
+          </div>
+          <Pagination
+            currentPage={currentPage}
+            totalPages={totalPages}
+            onPageChange={setCurrentPage}
+            totalItems={totalCount}
+            itemsPerPage={ITEMS_PER_PAGE}
+          />
+        </div>
+      )}
+
+      <Modal
+        isOpen={isModalOpen}
+        onClose={handleCancelModal}
+        title="Create QAQC/HSE Record"
+      >
+        <form onSubmit={handleSubmit(onSubmit)} className="space-y-4">
+          <FormField
+            label="Doc ID"
+            type="text"
+            {...register('dgt_docid')}
+            error={errors.dgt_docid?.message}
+          />
+
+          <FormField
+            label="Doc Reference"
+            type="text"
+            {...register('dgt_docref')}
+            error={errors.dgt_docref?.message}
+          />
+
+          <FormField
+            label="Document Subject"
+            type="text"
+            {...register('dgt_documentsubject')}
+            error={errors.dgt_documentsubject?.message}
+          />
+
+          <FormField
+            label="Discipline"
+            type="text"
+            {...register('dgt_discipline')}
+            error={errors.dgt_discipline?.message}
+          />
+
+          <FormField
+            label="Document Type"
+            type="text"
+            {...register('dgt_documenttype')}
+            error={errors.dgt_documenttype?.message}
+          />
+
+          <FormField
+            label="Submission Date"
+            type="date"
+            {...register('dgt_submissiondate')}
+            error={errors.dgt_submissiondate?.message}
+          />
+
+          <FormField
+            label="Response Date"
+            type="date"
+            {...register('dgt_responsedate')}
+            error={errors.dgt_responsedate?.message}
+          />
+
+          <FormField
+            label="Revision"
+            type="number"
+            {...register('dgt_revision', {
+              validate: (value) =>
+                !value || !isNaN(Number(value)) || 'Must be a valid number',
+            })}
+            error={errors.dgt_revision?.message}
+          />
+
+          <div>
+            <label htmlFor="dgt_status" className="block text-sm font-medium text-gray-700 mb-1">
+              Status
+            </label>
+            <select
+              id="dgt_status"
+              {...register('dgt_status')}
+              className="w-full px-3 py-2 border border-gray-300 rounded-md shadow-sm focus:outline-none focus:ring-blue-500 focus:border-blue-500"
+            >
+              <option value="">Select status...</option>
+              <option value="OPN">OPN - Open</option>
+              <option value="CLS">CLS - Closed</option>
+              <option value="REJ">REJ - Rejected</option>
+            </select>
+            {errors.dgt_status?.message && (
+              <p className="mt-1 text-sm text-red-600">{errors.dgt_status.message}</p>
+            )}
+          </div>
+
+          <div className="flex justify-end gap-3 pt-4">
+            <button
+              type="button"
+              onClick={handleCancelModal}
+              className="px-4 py-2 text-sm font-medium text-gray-700 bg-white border border-gray-300 rounded-md hover:bg-gray-50 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-blue-500"
+            >
+              Cancel
+            </button>
+            <button
+              type="submit"
+              disabled={saving}
+              className="inline-flex items-center px-4 py-2 text-sm font-medium text-white bg-blue-600 border border-transparent rounded-md hover:bg-blue-700 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-blue-500 disabled:opacity-50"
+            >
+              {saving ? (
+                <>
+                  <svg className="animate-spin -ml-1 mr-2 h-4 w-4 text-white" fill="none" viewBox="0 0 24 24">
+                    <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" />
+                    <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z" />
+                  </svg>
+                  Saving...
+                </>
+              ) : (
+                'Save'
+              )}
+            </button>
+          </div>
+        </form>
+      </Modal>
+
+      <ConfirmDialog
+        isOpen={!!deleteConfirm}
+        title="Delete Record"
+        message="Are you sure you want to delete this record? This action cannot be undone."
+        confirmLabel="Delete"
+        loading={deleting}
+        onConfirm={() => deleteConfirm && handleDelete(deleteConfirm)}
+        onCancel={() => setDeleteConfirm(null)}
+      />
+
+      <ConfirmDialog
+        isOpen={showDiscardConfirm}
+        title="Discard Changes"
+        message="You have unsaved changes. Are you sure you want to discard them?"
+        confirmLabel="Discard"
+        cancelLabel="Keep Editing"
+        variant="warning"
+        onConfirm={() => { setShowDiscardConfirm(false); setIsModalOpen(false); reset() }}
+        onCancel={() => setShowDiscardConfirm(false)}
+      />
+    </div>
+  )
+}

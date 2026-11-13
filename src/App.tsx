@@ -1,0 +1,787 @@
+import { useState, useEffect, useCallback } from 'react'
+import { useAppNavigation } from '@/lib/appNavigation'
+import { supabase, schemaClient } from '@/lib/supabase'
+import type { ProjectData } from '@/types/database'
+import { ConfirmDialog } from '@/components/ConfirmDialog'
+import { Notification } from '@/components/Notification'
+import { useNotification } from '@/hooks/useNotification'
+import { EngineeringForm } from '@/forms/EngineeringForm'
+import { QaqcHseForm } from '@/forms/QaqcHseForm'
+import { ActualResourcesForm } from '@/forms/ActualResourcesForm'
+import { DynamicActualDataForm } from '@/forms/DynamicActualDataForm'
+import { ProjectDataForm } from '@/forms/ProjectDataForm'
+import { AreasOfConcernForm } from '@/forms/AreasOfConcernForm'
+import { VariationsForm } from '@/forms/VariationsForm'
+import { PaymentsForm } from '@/forms/PaymentsForm'
+import { ReferenceDataForm } from '@/forms/ReferenceDataForm'
+import { P6ActivityOutputForm } from '@/forms/P6ActivityOutputForm'
+import { P6ActivityUpdatesForm } from '@/forms/P6ActivityUpdatesForm'
+import { P6ProjectMappingForm } from '@/forms/P6ProjectMappingForm'
+import { PhotoUploadForm } from '@/forms/PhotoUploadForm'
+import { PdfUploadForm } from '@/forms/PdfUploadForm'
+import { ProjectDashboard } from '@/forms/ProjectDashboard'
+import { InspectionReportForm } from '@/forms/InspectionReportForm'
+import { ReportDashboardForm } from '@/forms/ReportDashboardForm'
+import { WeeklyReportForm } from '@/forms/WeeklyReportForm'
+
+type TabKey =
+  | 'dashboard'
+  | 'weekly_dashboard'
+  | 'engineering'
+  | 'qaqc'
+  | 'resources'
+  | 'dynamic'
+  | 'projectdata'
+  | 'aoc'
+  | 'variations'
+  | 'discipline'
+  | 'type'
+  | 'payments'
+  | 'referencedata'
+  | 'p6activityoutput'
+  | 'p6activityupdates'
+  | 'p6projectmapping'
+  | 'photos'
+  | 'pdfupload'
+  | 'inspectionreports'
+  | 'weekly_report'
+  | 'online_weekly_dashboard'
+
+interface NavItem {
+  key: TabKey
+  label: string
+  icon: JSX.Element
+  badgeKey?: 'stale' | 'updates'
+}
+
+interface NavSection {
+  id: string
+  label: string
+  items: NavItem[]
+}
+
+const navSections: NavSection[] = [
+  {
+    id: 'workflow',
+    label: 'WEEKLY WORKFLOW',
+    items: [
+      {
+        key: 'projectdata',
+        label: 'Project Data',
+        badgeKey: 'stale',
+        icon: (
+          <svg className="w-4 h-4 flex-shrink-0" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+            <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 12h6m-6 4h6m2 5H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z" />
+          </svg>
+        ),
+      },
+      {
+        key: 'p6activityupdates',
+        label: 'Activity Updates',
+        badgeKey: 'updates',
+        icon: (
+          <svg className="w-4 h-4 flex-shrink-0" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+            <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15" />
+          </svg>
+        ),
+      },
+      {
+        key: 'p6activityoutput',
+        label: 'Activity Output',
+        icon: (
+          <svg className="w-4 h-4 flex-shrink-0" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+            <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 17v-2m3 2v-4m3 4v-6m2 10H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z" />
+          </svg>
+        ),
+      },
+    ],
+  },
+  {
+    id: 'documents',
+    label: 'DOCUMENTS',
+    items: [
+      {
+        key: 'engineering',
+        label: 'Engineering',
+        icon: (
+          <svg className="w-4 h-4 flex-shrink-0" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+            <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M10.325 4.317c.426-1.756 2.924-1.756 3.35 0a1.724 1.724 0 002.573 1.066c1.543-.94 3.31.826 2.37 2.37a1.724 1.724 0 001.065 2.572c1.756.426 1.756 2.924 0 3.35a1.724 1.724 0 00-1.066 2.573c.94 1.543-.826 3.31-2.37 2.37a1.724 1.724 0 00-2.572 1.065c-.426 1.756-2.924 1.756-3.35 0a1.724 1.724 0 00-2.573-1.066c-1.543.94-3.31-.826-2.37-2.37a1.724 1.724 0 00-1.065-2.572c-1.756-.426-1.756-2.924 0-3.35a1.724 1.724 0 001.066-2.573c-.94-1.543.826-3.31 2.37-2.37.996.608 2.296.07 2.572-1.065z" /><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M15 12a3 3 0 11-6 0 3 3 0 016 0z" />
+          </svg>
+        ),
+      },
+      {
+        key: 'qaqc',
+        label: 'QAQC / HSE',
+        icon: (
+          <svg className="w-4 h-4 flex-shrink-0" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+            <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 12l2 2 4-4m6 2a9 9 0 11-18 0 9 9 0 0118 0z" />
+          </svg>
+        ),
+      },
+      {
+        key: 'pdfupload',
+        label: 'PDF Upload',
+        icon: (
+          <svg className="w-4 h-4 flex-shrink-0" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+            <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-8l-4-4m0 0L8 8m4-4v12" />
+          </svg>
+        ),
+      },
+    ],
+  },
+  {
+    id: 'site',
+    label: 'SITE',
+    items: [
+      {
+        key: 'resources',
+        label: 'Actual Resources',
+        icon: (
+          <svg className="w-4 h-4 flex-shrink-0" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+            <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M17 20h5v-2a3 3 0 00-5.356-1.857M17 20H7m10 0v-2c0-.656-.126-1.283-.356-1.857M7 20H2v-2a3 3 0 015.356-1.857M7 20v-2c0-.656.126-1.283.356-1.857m0 0a5.002 5.002 0 019.288 0M15 7a3 3 0 11-6 0 3 3 0 016 0zm6 3a2 2 0 11-4 0 2 2 0 014 0zM7 10a2 2 0 11-4 0 2 2 0 014 0z" />
+          </svg>
+        ),
+      },
+      {
+        key: 'photos',
+        label: 'Photos',
+        icon: (
+          <svg className="w-4 h-4 flex-shrink-0" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+            <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 16l4.586-4.586a2 2 0 012.828 0L16 16m-2-2l1.586-1.586a2 2 0 012.828 0L20 14m-6-6h.01M6 20h12a2 2 0 002-2V6a2 2 0 00-2-2H6a2 2 0 00-2 2v12a2 2 0 002 2z" />
+          </svg>
+        ),
+      },
+    ],
+  },
+  {
+    id: 'reference',
+    label: 'REFERENCE',
+    items: [
+      {
+        key: 'dynamic',
+        label: 'Progress Data',
+        icon: (
+          <svg className="w-4 h-4 flex-shrink-0" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+            <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M13 10V3L4 14h7v7l9-11h-7z" />
+          </svg>
+        ),
+      },
+      {
+        key: 'p6projectmapping',
+        label: 'Project Mapping',
+        icon: (
+          <svg className="w-4 h-4 flex-shrink-0" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+            <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M8 7h12m0 0l-4-4m4 4l-4 4m0 6H4m0 0l4 4m-4-4l4-4" />
+          </svg>
+        ),
+      },
+      {
+        key: 'aoc',
+        label: 'Areas of Concern',
+        icon: (
+          <svg className="w-4 h-4 flex-shrink-0" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+            <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-2.5L13.732 4c-.77-.833-2.194-.833-2.964 0L3.34 16.5c-.77.833.192 2.5 1.732 2.5z" />
+          </svg>
+        ),
+      },
+      {
+        key: 'variations',
+        label: 'Variations',
+        icon: (
+          <svg className="w-4 h-4 flex-shrink-0" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+            <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M7 16V4m0 0L3 8m4-4l4 4m6 8v-4m0 4l-4-4m4 4l4-4M3 12h18" />
+          </svg>
+        ),
+      },
+      {
+        key: 'payments',
+        label: 'Payments',
+        icon: (
+          <svg className="w-4 h-4 flex-shrink-0" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+            <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M17 9V7a2 2 0 00-2-2H5a2 2 0 00-2 2v6a2 2 0 002 2h2m2 4h10a2 2 0 002-2v-6a2 2 0 00-2-2H9a2 2 0 00-2 2v6a2 2 0 002 2zm7-5a2 2 0 11-4 0 2 2 0 014 0z" />
+          </svg>
+        ),
+      },
+      {
+        key: 'referencedata',
+        label: 'Reference Data',
+        icon: (
+          <svg className="w-4 h-4 flex-shrink-0" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+            <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 5a1 1 0 011-1h4a1 1 0 011 1v4a1 1 0 01-1 1H5a1 1 0 01-1-1V5zm10 0a1 1 0 011-1h4a1 1 0 011 1v4a1 1 0 01-1 1h-4a1 1 0 01-1-1V5zM4 15a1 1 0 011-1h4a1 1 0 011 1v4a1 1 0 01-1 1H5a1 1 0 01-1-1v-4zm10 0a1 1 0 011-1h4a1 1 0 011 1v4a1 1 0 01-1 1h-4a1 1 0 01-1-1v-4z" />
+          </svg>
+        ),
+      },
+    ],
+  },
+  {
+    id: 'reports',
+    label: 'REPORTS',
+    items: [
+      {
+        key: 'weekly_dashboard',
+        label: 'Weekly Dashboard',
+        icon: (
+          <svg className="w-4 h-4 flex-shrink-0" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+            <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 17V7m0 10a2 2 0 01-2 2H5a2 2 0 01-2-2V7a2 2 0 012-2h2a2 2 0 012 2m0 10a2 2 0 002 2h2a2 2 0 002-2M9 7a2 2 0 012-2h2a2 2 0 012 2m0 10V7m0 10a2 2 0 002 2h2a2 2 0 002-2V7a2 2 0 00-2-2h-2a2 2 0 00-2 2" />
+          </svg>
+        ),
+      },
+      {
+        key: 'weekly_report',
+        label: 'Weekly Report',
+        icon: (
+          <svg className="w-4 h-4 flex-shrink-0" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+            <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 12h6m-6 4h6m2 5H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z" />
+          </svg>
+        ),
+      },
+      {
+        key: 'online_weekly_dashboard',
+        label: 'Online Weekly Dashboard',
+        icon: (
+          <svg className="w-4 h-4 flex-shrink-0" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+            <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M3 12l2-2m0 0l7-7 7 7M5 10v10a1 1 0 001 1h3m10-11l2 2m-2-2v10a1 1 0 01-1 1h-3m-6 0a1 1 0 001-1v-4a1 1 0 011-1h2a1 1 0 011 1v4a1 1 0 001 1m-6 0h6" />
+          </svg>
+        ),
+      },
+    ],
+  },
+]
+
+// Flat list for label lookup
+const allNavItems: NavItem[] = navSections.flatMap(s => s.items)
+const navigationTabs = allNavItems.map(item => item.key)
+
+interface ProjectInfo {
+  id: string
+  projectname: string | null
+  contractorsname: string | null
+  textProjectId: string | null
+  location: string | null
+  startdate: string | null
+  enddate: string | null
+}
+
+function App() {
+  const { view, activeTab, selectedProjectId, selectedSchemaName, navigate } = useAppNavigation(navigationTabs)
+  const setActiveTab = (tab: TabKey) => navigate({ activeTab: tab })
+  const [sidebarExpanded, setSidebarExpanded] = useState(true)
+  const [collapsedSections, setCollapsedSections] = useState<Record<string, boolean>>({})
+  const [projectInfo, setProjectInfo] = useState<ProjectInfo[]>([])
+  const [runUpdateLoading, setRunUpdateLoading] = useState(false)
+  const [showRunUpdateConfirm, setShowRunUpdateConfirm] = useState(false)
+  const [isDataStale, setIsDataStale] = useState(false)
+  const [updatesCount, setUpdatesCount] = useState(0)
+
+  const { notification, hideNotification, showSuccess, showError } = useNotification()
+
+  const fetchSidebarBadges = useCallback(async (projectId: string, schemaName: string) => {
+    if (!projectId || !schemaName || schemaName === 'public') return
+    const db = schemaClient(schemaName)
+    try {
+      // Check if data date is stale (> 8 days old)
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const { data: pdData } = await (db as any)
+        .from('dbp6_0000_projectdata')
+        .select('dgt_datadate')
+        .eq('dgt_dbp6bd00projectdataid', projectId)
+        .maybeSingle()
+      if (pdData?.dgt_datadate) {
+        const daysDiff = (Date.now() - new Date(pdData.dgt_datadate).getTime()) / 86400000
+        setIsDataStale(daysDiff > 8)
+      } else {
+        setIsDataStale(false)
+      }
+    } catch { setIsDataStale(false) }
+
+    try {
+      // Count activity updates pending (mrk_uptd = 1)
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const { count } = await (db as any)
+        .from('p6_activity_updates')
+        .select('*', { count: 'exact', head: true })
+        .eq('mrk_uptd', 1)
+      setUpdatesCount(count ?? 0)
+    } catch { setUpdatesCount(0) }
+  }, [])
+
+  const toggleSection = (sectionId: string) => {
+    setCollapsedSections(prev => ({ ...prev, [sectionId]: !prev[sectionId] }))
+  }
+
+  const fetchProjectInfo = async () => {
+    const { data } = await supabase
+      .from('dbp6_0000_projectdata')
+      .select('*')
+      .order('dgt_projectname', { ascending: true })
+    const rows = data as ProjectData[] | null
+    if (rows) {
+      setProjectInfo(rows.map(p => ({
+        id: p.dgt_dbp6bd00projectdataid,
+        projectname: p.dgt_projectname,
+        contractorsname: p.dgt_contractorsname,
+        textProjectId: p.dgt_projectid,
+        location: p.dgt_location,
+        startdate: p.dgt_projectstartdate,
+        enddate: p.dgt_projectenddate,
+      })))
+    }
+  }
+
+  useEffect(() => {
+    fetchProjectInfo()
+  }, [])
+
+  const handleSelectProject = async (projectId: string) => {
+    const project = projectInfo.find(p => p.id === projectId)
+    let schemaName = 'public'
+    if (project?.textProjectId) {
+      const { data } = await supabase
+        .from('p6_project_mapping')
+        .select('schema_name')
+        .eq('dgt_projectid', project.textProjectId)
+        .maybeSingle()
+      schemaName = (data as { schema_name?: string | null } | null)?.schema_name || 'public'
+    }
+    navigate({ selectedSchemaName: schemaName, selectedProjectId: projectId, activeTab: 'dashboard', view: 'app' })
+    fetchSidebarBadges(projectId, schemaName)
+  }
+
+  useEffect(() => {
+    if (selectedProjectId && selectedSchemaName && selectedSchemaName !== 'public') {
+      fetchSidebarBadges(selectedProjectId, selectedSchemaName)
+    }
+  }, [selectedProjectId, selectedSchemaName, fetchSidebarBadges])
+
+  const handleBackToHome = () => {
+    fetchProjectInfo()
+    navigate({ view: 'home', selectedProjectId: '', selectedSchemaName: 'public' })
+  }
+
+  const handleRunUpdate = async () => {
+    setShowRunUpdateConfirm(false)
+    setRunUpdateLoading(true)
+    const projectTextId = selectedProject?.textProjectId || ''
+    const params = new URLSearchParams({ project_id: projectTextId, schema: selectedSchemaName, t: Date.now().toString() })
+    try {
+      // Step 1 — Webhook 51
+      const res51 = await fetch(`https://pmc2p2c.app.n8n.cloud/webhook/70203aa4-fa3c-4a68-a9c4-5454b3ea8dec?${params}`, { method: 'GET' })
+      if (!res51.ok) throw new Error(`Webhook 51 failed (${res51.status})`)
+
+      // Step 2 — Webhook 53
+      const res53 = await fetch(`https://pmc2p2c.app.n8n.cloud/webhook/ec7b88dc-e7f3-44df-8fde-4c9beaa14ba8?${params}`, { method: 'GET' })
+      if (!res53.ok) throw new Error(`Webhook 53 failed (${res53.status})`)
+
+      // Step 3 — insert into p6_update_queue (same as Activity Updates form)
+      const { error } = await schemaClient(selectedSchemaName)
+        .from('p6_update_queue')
+        .insert({ project_code: projectTextId, status: 'pending' } as never)
+      if (error) throw new Error(error.message)
+
+      showSuccess('P6 update triggered successfully')
+    } catch (err) {
+      showError('Failed to run update: ' + (err instanceof Error ? err.message : String(err)))
+    } finally {
+      setRunUpdateLoading(false)
+    }
+  }
+
+  const selectedProject = projectInfo.find(p => p.id === selectedProjectId)
+
+  const renderTabContent = () => {
+    const projectTextId = selectedProject?.textProjectId || ''
+    switch (activeTab) {
+      case 'dashboard':
+        return (
+          <ProjectDashboard
+            projectId={selectedProjectId}
+            projectTextId={projectTextId}
+            schemaName={selectedSchemaName}
+            onNavigate={(tab) => setActiveTab(tab as TabKey)}
+            onRunUpdate={() => setShowRunUpdateConfirm(true)}
+            runUpdateLoading={runUpdateLoading}
+          />
+        )
+      case 'weekly_dashboard':
+        return (
+          <ReportDashboardForm
+            projectId={selectedProjectId}
+            projectTextId={projectTextId}
+            schemaName={selectedSchemaName}
+            a3Mode={true}
+          />
+        )
+      case 'engineering':
+        return <EngineeringForm projectId={selectedProjectId} projectTextId={projectTextId} schemaName={selectedSchemaName} />
+      case 'qaqc':
+        return <QaqcHseForm projectId={selectedProjectId} projectTextId={projectTextId} schemaName={selectedSchemaName} />
+      case 'resources':
+        return <ActualResourcesForm projectTextId={projectTextId} schemaName={selectedSchemaName} />
+      case 'dynamic':
+        return <DynamicActualDataForm projectId={selectedProjectId} schemaName={selectedSchemaName} />
+      case 'projectdata':
+        return <ProjectDataForm projectId={selectedProjectId} projectTextId={projectTextId} schemaName={selectedSchemaName} />
+      case 'aoc':
+        return <AreasOfConcernForm projectId={selectedProjectId} schemaName={selectedSchemaName} />
+      case 'variations':
+        return <VariationsForm projectTextId={projectTextId} schemaName={selectedSchemaName} />
+      case 'payments':
+        return <PaymentsForm projectId={selectedProjectId} schemaName={selectedSchemaName} />
+      case 'referencedata':
+        return <ReferenceDataForm schemaName={selectedSchemaName} />
+      case 'p6activityoutput':
+        return <P6ActivityOutputForm projectTextId={projectTextId} schemaName={selectedSchemaName} />
+      case 'p6activityupdates':
+        return <P6ActivityUpdatesForm projectTextId={projectTextId} schemaName={selectedSchemaName} />
+      case 'p6projectmapping':
+        return <P6ProjectMappingForm />
+      case 'photos':
+        return <PhotoUploadForm projectId={selectedProjectId} schemaName={selectedSchemaName} />
+      case 'pdfupload':
+        return <PdfUploadForm projectId={selectedProjectId} projectTextId={projectTextId} schemaName={selectedSchemaName} />
+      case 'inspectionreports':
+        return <InspectionReportForm projectId={selectedProjectId} projectTextId={projectTextId} schemaName={selectedSchemaName} />
+      case 'weekly_report':
+        return (
+          <WeeklyReportForm
+            projectId={selectedProjectId}
+            projectTextId={projectTextId}
+            schemaName={selectedSchemaName}
+          />
+        )
+      case 'online_weekly_dashboard':
+        return (
+          <ReportDashboardForm
+            projectId={selectedProjectId}
+            projectTextId={projectTextId}
+            schemaName={selectedSchemaName}
+          />
+        )
+      default:
+        return null
+    }
+  }
+
+  const activeLabel = activeTab === 'dashboard' ? 'Dashboard' : (allNavItems.find(t => t.key === activeTab)?.label ?? '')
+
+  const formatDate = (d: string | null) => {
+    if (!d) return null
+    try { return new Date(d).toLocaleDateString('en-GB', { month: 'short', year: 'numeric' }) } catch { return null }
+  }
+
+  if (view === 'home') {
+    return (
+      <div className="min-h-screen bg-gray-100">
+        <div className="max-w-6xl mx-auto px-6 py-12">
+          <div className="text-center mb-10">
+            <div className="flex justify-center mb-4">
+              <div className="bg-blue-600 p-3 rounded-xl">
+                <svg className="w-8 h-8 text-white" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 17V7m0 10a2 2 0 01-2 2H5a2 2 0 01-2-2V7a2 2 0 012-2h2a2 2 0 012 2m0 10a2 2 0 002 2h2a2 2 0 002-2M9 7a2 2 0 012-2h2a2 2 0 012 2m0 10V7m0 10a2 2 0 002 2h2a2 2 0 002-2V7a2 2 0 00-2-2h-2a2 2 0 00-2 2" />
+                </svg>
+              </div>
+            </div>
+            <h1 className="text-3xl font-bold text-gray-900">P6 Project Controls</h1>
+            <p className="text-gray-500 mt-2">Select a project to view and manage its data</p>
+          </div>
+
+          {projectInfo.length === 0 ? (
+            <div className="text-center py-16 text-gray-500">
+              <p className="text-lg">No projects found.</p>
+              <p className="text-sm mt-1">Go to Project Data to create a new project.</p>
+              <button
+                onClick={() => navigate({ selectedProjectId: '', selectedSchemaName: 'public', view: 'app', activeTab: 'projectdata' })}
+                className="mt-4 px-4 py-2 bg-blue-600 text-white text-sm font-medium rounded-lg hover:bg-blue-700"
+              >
+                Go to Project Data
+              </button>
+            </div>
+          ) : (
+            <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-5">
+              {projectInfo.map(p => (
+                <div
+                  key={p.id}
+                  className="bg-white rounded-xl shadow-sm border border-gray-200 p-5 hover:shadow-md transition-shadow flex flex-col"
+                >
+                  <div className="flex-1">
+                    <h3 className="text-base font-bold text-gray-900 leading-tight">
+                      {p.projectname || 'Unnamed Project'}
+                    </h3>
+                    {p.contractorsname && (
+                      <p className="text-sm text-gray-600 mt-1">{p.contractorsname}</p>
+                    )}
+                    {p.location && (
+                      <p className="text-xs text-gray-400 mt-1 flex items-center gap-1">
+                        <svg className="w-3 h-3 flex-shrink-0" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                          <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M17.657 16.657L13.414 20.9a1.998 1.998 0 01-2.827 0l-4.244-4.243a8 8 0 1111.314 0z" />
+                          <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M15 11a3 3 0 11-6 0 3 3 0 016 0z" />
+                        </svg>
+                        {p.location}
+                      </p>
+                    )}
+                    {(p.startdate || p.enddate) && (
+                      <p className="text-xs text-gray-400 mt-1">
+                        {formatDate(p.startdate)}{p.startdate && p.enddate ? ' → ' : ''}{formatDate(p.enddate)}
+                      </p>
+                    )}
+                    {p.textProjectId && (
+                      <p className="text-xs font-mono text-gray-400 mt-2">{p.textProjectId}</p>
+                    )}
+                  </div>
+                  <button
+                    onClick={() => handleSelectProject(p.id)}
+                    className="mt-4 w-full px-4 py-2 bg-blue-600 text-white text-sm font-semibold rounded-lg hover:bg-blue-700 transition-colors"
+                  >
+                    Open Project
+                  </button>
+                </div>
+              ))}
+            </div>
+          )}
+        </div>
+      </div>
+    )
+  }
+
+  return (
+    <div className="flex h-screen bg-gray-100 overflow-hidden">
+      {notification && (
+        <Notification
+          type={notification.type}
+          message={notification.message}
+          onClose={hideNotification}
+        />
+      )}
+
+      <ConfirmDialog
+        isOpen={showRunUpdateConfirm}
+        title="Run Update"
+        message="This will run Webhook 51, then Webhook 53, then queue a P6 update for the current project. Are you sure you want to proceed?"
+        confirmLabel="Run Update"
+        onConfirm={handleRunUpdate}
+        onCancel={() => setShowRunUpdateConfirm(false)}
+      />
+      {/* Sidebar */}
+      <aside
+        className={`no-print flex flex-col bg-white border-r border-gray-200 transition-all duration-300 flex-shrink-0 ${
+          sidebarExpanded ? 'w-56' : 'w-14'
+        }`}
+      >
+        {/* Logo / Brand */}
+        <div className={`flex items-center gap-2.5 px-3 py-3.5 border-b border-gray-200 ${sidebarExpanded ? '' : 'justify-center'}`}>
+          <div className="bg-blue-600 p-1.5 rounded-lg flex-shrink-0">
+            <svg className="w-4 h-4 text-white" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 17V7m0 10a2 2 0 01-2 2H5a2 2 0 01-2-2V7a2 2 0 012-2h2a2 2 0 012 2m0 10a2 2 0 002 2h2a2 2 0 002-2M9 7a2 2 0 012-2h2a2 2 0 012 2m0 10V7m0 10a2 2 0 002 2h2a2 2 0 002-2V7a2 2 0 00-2-2h-2a2 2 0 00-2 2" />
+            </svg>
+          </div>
+          {sidebarExpanded && (
+            <div className="overflow-hidden">
+              <p className="text-sm font-bold text-gray-900 leading-tight">P6 Controls</p>
+              <p className="text-xs text-gray-400 leading-tight">Data Management</p>
+            </div>
+          )}
+        </div>
+
+        {/* Nav */}
+        <nav className="flex-1 overflow-y-auto py-2">
+
+          {/* Dashboard / Home */}
+          <div className={`px-2 mb-1`}>
+            <button
+              onClick={() => setActiveTab('dashboard')}
+              title={!sidebarExpanded ? 'Dashboard' : undefined}
+              className={`w-full flex items-center gap-2.5 px-2 py-2 rounded-lg text-sm font-semibold transition-colors ${
+                sidebarExpanded ? '' : 'justify-center'
+              } ${
+                activeTab === 'dashboard'
+                  ? 'bg-blue-600 text-white shadow-sm'
+                  : 'text-gray-700 hover:bg-gray-100'
+              }`}
+            >
+              <svg className="w-4 h-4 flex-shrink-0" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M3 12l2-2m0 0l7-7 7 7M5 10v10a1 1 0 001 1h3m10-11l2 2m-2-2v10a1 1 0 01-1 1h-3m-6 0a1 1 0 001-1v-4a1 1 0 011-1h2a1 1 0 011 1v4a1 1 0 001 1m-6 0h6" />
+              </svg>
+              {sidebarExpanded && <span>Dashboard</span>}
+            </button>
+          </div>
+
+          {sidebarExpanded && <div className="mx-3 my-1 border-t border-gray-100" />}
+
+          {/* Grouped sections */}
+          {navSections.map(section => {
+            const isCollapsed = !!collapsedSections[section.id]
+            const hasActiveBadge = section.items.some(item =>
+              (item.badgeKey === 'stale' && isDataStale) ||
+              (item.badgeKey === 'updates' && updatesCount > 0)
+            )
+            return (
+              <div key={section.id} className="mb-1">
+                {sidebarExpanded ? (
+                  /* Section header — clickable to collapse */
+                  <button
+                    onClick={() => toggleSection(section.id)}
+                    className="w-full flex items-center justify-between px-3 pt-3 pb-1 group"
+                  >
+                    <span className="text-[10px] font-bold text-gray-400 tracking-widest uppercase">
+                      {section.label}
+                    </span>
+                    <div className="flex items-center gap-1">
+                      {hasActiveBadge && isCollapsed && (
+                        <span className="w-1.5 h-1.5 rounded-full bg-amber-400 flex-shrink-0" />
+                      )}
+                      <svg
+                        className={`w-3 h-3 text-gray-400 transition-transform ${isCollapsed ? '-rotate-90' : ''}`}
+                        fill="none" viewBox="0 0 24 24" stroke="currentColor"
+                      >
+                        <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 9l-7 7-7-7" />
+                      </svg>
+                    </div>
+                  </button>
+                ) : (
+                  /* Collapsed sidebar — just a divider */
+                  <div className="mx-2 my-2 border-t border-gray-100" />
+                )}
+
+                {/* Section items */}
+                {(!isCollapsed || !sidebarExpanded) && (
+                  <div className="px-2 space-y-0.5">
+                    {section.items.map(item => {
+                      const isActive = activeTab === item.key
+                      const showStaleBadge = item.badgeKey === 'stale' && isDataStale
+                      const showCountBadge = item.badgeKey === 'updates' && updatesCount > 0
+                      return (
+                        <button
+                          key={item.key}
+                          onClick={() => setActiveTab(item.key)}
+                          title={!sidebarExpanded ? `${item.label}${showStaleBadge ? ' ⚠ Data may be stale' : ''}${showCountBadge ? ` (${updatesCount} pending)` : ''}` : undefined}
+                          className={`w-full flex items-center gap-2.5 px-2 py-1.5 rounded-lg text-sm transition-colors ${
+                            sidebarExpanded ? '' : 'justify-center'
+                          } ${
+                            isActive
+                              ? 'bg-blue-50 text-blue-700 font-medium'
+                              : 'text-gray-600 hover:bg-gray-50 hover:text-gray-900'
+                          }`}
+                        >
+                          {item.icon}
+                          {sidebarExpanded && (
+                            <>
+                              <span className="flex-1 truncate text-left">{item.label}</span>
+                              {showStaleBadge && (
+                                <span className="w-2 h-2 rounded-full bg-amber-400 flex-shrink-0" title="Data may be stale" />
+                              )}
+                              {showCountBadge && (
+                                <span className="flex-shrink-0 min-w-[18px] h-[18px] px-1 rounded-full bg-blue-600 text-white text-[10px] font-bold flex items-center justify-center">
+                                  {updatesCount > 99 ? '99+' : updatesCount}
+                                </span>
+                              )}
+                            </>
+                          )}
+                          {/* collapsed sidebar stale dot rendered via title tooltip instead */}
+                        </button>
+                      )
+                    })}
+                  </div>
+                )}
+              </div>
+            )
+          })}
+        </nav>
+
+        {/* Toggle button */}
+        <div className="border-t border-gray-200 p-2">
+          <button
+            onClick={() => setSidebarExpanded(prev => !prev)}
+            title={sidebarExpanded ? 'Collapse sidebar' : 'Expand sidebar'}
+            className={`w-full flex items-center gap-2 px-2 py-1.5 text-xs text-gray-400 hover:text-gray-600 hover:bg-gray-50 rounded-md transition-colors ${
+              sidebarExpanded ? '' : 'justify-center'
+            }`}
+          >
+            {sidebarExpanded ? (
+              <>
+                <svg className="w-3.5 h-3.5 flex-shrink-0" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M11 19l-7-7 7-7m8 14l-7-7 7-7" />
+                </svg>
+                <span>Collapse</span>
+              </>
+            ) : (
+              <svg className="w-3.5 h-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M13 5l7 7-7 7M5 5l7 7-7 7" />
+              </svg>
+            )}
+          </button>
+        </div>
+      </aside>
+
+      {/* Main area */}
+      <div className="flex flex-col flex-1 overflow-hidden">
+        {/* Header */}
+        <header className="no-print bg-white border-b border-gray-200 flex-shrink-0">
+          <div className="px-6 py-2 border-b border-gray-100 overflow-x-auto">
+            <div className="flex items-center gap-4 whitespace-nowrap">
+              <button
+                onClick={handleBackToHome}
+                className="flex items-center gap-1.5 text-sm text-blue-600 hover:text-blue-800 font-medium"
+              >
+                <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M15 19l-7-7 7-7" />
+                </svg>
+                Projects
+              </button>
+              <div className="h-4 w-px bg-gray-300" />
+              <div className="flex items-center gap-1.5">
+                <span className="text-xs text-gray-500">Contractor:</span>
+                <span className="text-sm font-semibold text-gray-900">{selectedProject?.contractorsname || '—'}</span>
+              </div>
+              <div className="h-4 w-px bg-gray-300" />
+              <div className="flex items-center gap-1.5">
+                <span className="text-xs text-gray-500">Project:</span>
+                <span className="text-sm font-semibold text-gray-900">{selectedProject?.projectname || '—'}</span>
+              </div>
+              <div className="ml-auto flex items-center gap-2">
+                <button
+                  onClick={() => setShowRunUpdateConfirm(true)}
+                  disabled={runUpdateLoading || !selectedProject?.textProjectId}
+                  style={{ display: activeTab === 'dashboard' ? 'none' : undefined }}
+                  title={!selectedProject?.textProjectId ? 'No project selected' : undefined}
+                  className="inline-flex items-center gap-1.5 px-3 py-1.5 text-sm font-medium rounded-md text-white bg-emerald-600 hover:bg-emerald-700 disabled:opacity-50 disabled:cursor-not-allowed transition-colors"
+                >
+                  {runUpdateLoading ? (
+                    <>
+                      <svg className="w-4 h-4 animate-spin" fill="none" viewBox="0 0 24 24">
+                        <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" />
+                        <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8v8z" />
+                      </svg>
+                      Running…
+                    </>
+                  ) : (
+                    <>
+                      <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                        <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15" />
+                      </svg>
+                      Run Update
+                    </>
+                  )}
+                </button>
+              </div>
+            </div>
+          </div>
+          <div className="px-6 py-2">
+            <h2 className="text-2xl font-bold text-gray-900 text-center">{activeLabel}</h2>
+          </div>
+        </header>
+
+        {/* Content */}
+        <main className="print-main flex-1 overflow-y-auto px-6 py-6">
+          {renderTabContent()}
+        </main>
+
+        {/* Footer */}
+        <footer className="no-print bg-white border-t border-gray-200 px-6 py-3 flex-shrink-0">
+          <p className="text-center text-xs text-gray-400">P6 Project Controls Data Management</p>
+        </footer>
+      </div>
+    </div>
+  )
+}
+
+export default App

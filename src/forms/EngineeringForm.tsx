@@ -1,0 +1,1111 @@
+import { useState, useEffect } from 'react'
+import { useForm } from 'react-hook-form'
+import { schemaClient } from '@/lib/supabase'
+import type { Engineering, Type, Discipline } from '@/types/database'
+import { Modal } from '@/components/Modal'
+import { Pagination } from '@/components/Pagination'
+import { SearchFilter } from '@/components/SearchFilter'
+import { LoadingSpinner } from '@/components/LoadingSpinner'
+import { FormField } from '@/components/FormField'
+import { Notification } from '@/components/Notification'
+import { useNotification } from '@/hooks/useNotification'
+import { ColumnFilter } from '@/components/ColumnFilter'
+import { DateColumnFilter } from '@/components/DateColumnFilter'
+import { ConfirmDialog } from '@/components/ConfirmDialog'
+import { CsvControls } from '@/components/CsvControls'
+import { exportToCsv } from '@/utils/csv'
+
+interface EngineeringFormData {
+  dgt_dbp6bd00projectdataid: string
+  // Fields for creating new records
+  dgt_dtfid: string
+  dgt_transmittalref: string
+  dgt_transmittalsubject: string
+  dgt_discipline: string
+  dgt_plannedsubmissiondate: string
+  dgt_plannedapprovaldate: string
+  dgt_transmittaltype: string
+  is_long_lead: boolean
+  // Fields editable for both create and edit
+  dgt_actualsubmissiondate: string
+  dgt_actualreturndate: string
+  dgt_revision: string
+  dgt_status: string
+}
+
+const ITEMS_PER_PAGE = 15
+
+type SortField = 'dgt_transmittalref' | 'dgt_transmittalsubject' | 'dgt_discipline' | 'dgt_transmittaltype' | 'dgt_plannedsubmissiondate' | 'dgt_plannedapprovaldate' | 'dgt_actualsubmissiondate' | 'dgt_actualreturndate' | 'dgt_revision' | 'dgt_status'
+type SortDirection = 'asc' | 'desc'
+
+
+
+export function EngineeringForm({ projectId, projectTextId, schemaName }: { projectId: string; projectTextId: string; schemaName: string }) {
+  const supabase = schemaClient(schemaName)
+  const [data, setData] = useState<Engineering[]>([])
+  const [filterData, setFilterData] = useState<Pick<Engineering, 'dgt_transmittalref' | 'dgt_discipline' | 'dgt_transmittaltype' | 'dgt_plannedsubmissiondate' | 'dgt_plannedapprovaldate' | 'dgt_actualsubmissiondate' | 'dgt_actualreturndate' | 'dgt_revision' | 'dgt_status' | 'mod_id'>[]>([])
+  const [totalCount, setTotalCount] = useState(0)
+  const [types, setTypes] = useState<Type[]>([])
+  const [projects, setProjects] = useState<{ dgt_dbp6bd00projectdataid: string; dgt_projectname: string | null }[]>([])
+  const [loading, setLoading] = useState(true)
+  const [webhookStatus, setWebhookStatus] = useState<'idle' | 'loading' | 'success' | 'error'>('idle')
+  const [isModalOpen, setIsModalOpen] = useState(false)
+  const [searchTerm, setSearchTerm] = useState('')
+  const [debouncedSearch, setDebouncedSearch] = useState('')
+  const [currentPage, setCurrentPage] = useState(1)
+  const [saving, setSaving] = useState(false)
+  const [editingId, setEditingId] = useState<string | null>(null)
+  const [editValues, setEditValues] = useState({ transmittalref: '', transmittalsubject: '', discipline: '', transmittaltype: '', plannedsubmissiondate: '', plannedapprovaldate: '', actualsubmissiondate: '', actualreturndate: '', revision: '', status: '', mod_id: '' })
+  const [showSaveConfirm, setShowSaveConfirm] = useState(false)
+  const [showEditCancelConfirm, setShowEditCancelConfirm] = useState(false)
+  const [sortField, setSortField] = useState<SortField | null>(null)
+  const [sortDirection, setSortDirection] = useState<SortDirection>('asc')
+  const [deleteConfirm, setDeleteConfirm] = useState<string | null>(null)
+  const [deleting, setDeleting] = useState(false)
+  const [showTypeLegend, setShowTypeLegend] = useState(false)
+  const [disciplines, setDisciplines] = useState<Discipline[]>([])
+  const [showDisciplineLegend, setShowDisciplineLegend] = useState(false)
+  const [showDiscardConfirm, setShowDiscardConfirm] = useState(false)
+  // Column filters
+  const [filters, setFilters] = useState({
+    dgt_transmittalref: '',
+    dgt_discipline: '',
+    dgt_transmittaltype: '',
+    dgt_plannedsubmissiondate: '',
+    dgt_plannedapprovaldate: '',
+    dgt_actualsubmissiondate: '',
+    dgt_actualreturndate: '',
+    dgt_revision: '',
+    dgt_status: '',
+    mod_id: '',
+  })
+  const { notification, hideNotification, showSuccess, showError } = useNotification()
+
+  const updateFilter = (field: keyof typeof filters, value: string) => {
+    setFilters(prev => ({ ...prev, [field]: value }))
+    setCurrentPage(1)
+  }
+
+  const {
+    register,
+    handleSubmit,
+    reset,
+    setValue,
+    formState: { errors, isDirty },
+  } = useForm<EngineeringFormData>()
+
+  const handleCancelModal = () => {
+    if (isDirty) {
+      setShowDiscardConfirm(true)
+    } else {
+      setIsModalOpen(false)
+    }
+  }
+
+  const fetchTypes = async () => {
+    const { data: typeRecords, error } = await supabase
+      .from('dbp6_0019_type')
+      .select('*')
+      .order('type_name', { ascending: true })
+
+    if (error) {
+      showError('Failed to fetch types: ' + error.message)
+      console.error('Error fetching types:', error)
+    } else {
+      console.log('Fetched types:', typeRecords)
+      setTypes(typeRecords || [])
+    }
+  }
+
+  const fetchProjects = async () => {
+    const { data: projectRecords } = await supabase
+      .from('dbp6_0000_projectdata')
+      .select('dgt_dbp6bd00projectdataid, dgt_projectname')
+      .order('dgt_projectname', { ascending: true })
+    setProjects(projectRecords || [])
+  }
+
+  const fetchFilterOptions = async () => {
+    if (!projectId) return
+    const { data: rows } = await supabase
+      .from('dbp6_000401_engineering_current')
+      .select('dgt_transmittalref,dgt_discipline,dgt_transmittaltype,dgt_plannedsubmissiondate,dgt_plannedapprovaldate,dgt_actualsubmissiondate,dgt_actualreturndate,dgt_revision,dgt_status,mod_id')
+      .eq('dgt_dbp6bd00projectdataid', projectId)
+    setFilterData((rows as typeof filterData | null) ?? [])
+  }
+
+  const fetchData = async () => {
+    if (!projectId) return
+    setLoading(true)
+    const from = (currentPage - 1) * ITEMS_PER_PAGE
+    const to = from + ITEMS_PER_PAGE - 1
+    let query = supabase
+      .from('dbp6_000401_engineering_current')
+      .select('*', { count: 'exact' })
+      .eq('dgt_dbp6bd00projectdataid', projectId)
+      .order(sortField ?? 'dgt_transmittalref', { ascending: sortDirection === 'asc' })
+      .range(from, to)
+    if (debouncedSearch) {
+      query = query.or(`dgt_transmittalref.ilike.%${debouncedSearch}%,dgt_transmittalsubject.ilike.%${debouncedSearch}%`)
+    }
+    if (filters.dgt_transmittalref) {
+      if (filters.dgt_transmittalref === 'BLANK') { query = query.is('dgt_transmittalref', null) }
+      else { query = query.eq('dgt_transmittalref', filters.dgt_transmittalref) }
+    }
+    if (filters.dgt_discipline) {
+      if (filters.dgt_discipline === 'BLANK') { query = query.is('dgt_discipline', null) }
+      else { query = query.eq('dgt_discipline', filters.dgt_discipline) }
+    }
+    if (filters.dgt_transmittaltype) {
+      if (filters.dgt_transmittaltype === 'BLANK') { query = query.is('dgt_transmittaltype', null) }
+      else { query = query.eq('dgt_transmittaltype', filters.dgt_transmittaltype) }
+    }
+    if (filters.dgt_plannedsubmissiondate) {
+      if (filters.dgt_plannedsubmissiondate === 'BLANK') { query = query.is('dgt_plannedsubmissiondate', null) }
+      else {
+        const [y, m] = filters.dgt_plannedsubmissiondate.split('-')
+        const start = `${y}-${m}-01`
+        const nextMonth = parseInt(m) === 12 ? `${parseInt(y)+1}-01-01` : `${y}-${String(parseInt(m)+1).padStart(2,'0')}-01`
+        query = query.gte('dgt_plannedsubmissiondate', start).lt('dgt_plannedsubmissiondate', nextMonth)
+      }
+    }
+    if (filters.dgt_plannedapprovaldate) {
+      if (filters.dgt_plannedapprovaldate === 'BLANK') { query = query.is('dgt_plannedapprovaldate', null) }
+      else {
+        const [y, m] = filters.dgt_plannedapprovaldate.split('-')
+        const start = `${y}-${m}-01`
+        const nextMonth = parseInt(m) === 12 ? `${parseInt(y)+1}-01-01` : `${y}-${String(parseInt(m)+1).padStart(2,'0')}-01`
+        query = query.gte('dgt_plannedapprovaldate', start).lt('dgt_plannedapprovaldate', nextMonth)
+      }
+    }
+    if (filters.dgt_actualsubmissiondate) {
+      if (filters.dgt_actualsubmissiondate === 'BLANK') { query = query.is('dgt_actualsubmissiondate', null) }
+      else {
+        const [y, m] = filters.dgt_actualsubmissiondate.split('-')
+        const start = `${y}-${m}-01`
+        const nextMonth = parseInt(m) === 12 ? `${parseInt(y)+1}-01-01` : `${y}-${String(parseInt(m)+1).padStart(2,'0')}-01`
+        query = query.gte('dgt_actualsubmissiondate', start).lt('dgt_actualsubmissiondate', nextMonth)
+      }
+    }
+    if (filters.dgt_actualreturndate) {
+      if (filters.dgt_actualreturndate === 'BLANK') { query = query.is('dgt_actualreturndate', null) }
+      else {
+        const [y, m] = filters.dgt_actualreturndate.split('-')
+        const start = `${y}-${m}-01`
+        const nextMonth = parseInt(m) === 12 ? `${parseInt(y)+1}-01-01` : `${y}-${String(parseInt(m)+1).padStart(2,'0')}-01`
+        query = query.gte('dgt_actualreturndate', start).lt('dgt_actualreturndate', nextMonth)
+      }
+    }
+    if (filters.dgt_revision) query = query.eq('dgt_revision', filters.dgt_revision)
+    if (filters.dgt_status) query = query.eq('dgt_status', filters.dgt_status)
+    if (filters.mod_id) query = query.eq('mod_id', filters.mod_id)
+    const { data: records, count, error } = await query
+    if (error) { showError('Failed to fetch data: ' + error.message) }
+    else { setData((records as Engineering[] | null) ?? []); setTotalCount(count ?? 0) }
+    setLoading(false)
+  }
+
+  const fetchDisciplines = async () => {
+    const { data: records } = await supabase.from('dbp6_0018_discipline').select('id, discipline_code, discipline_name').order('discipline_code', { ascending: true })
+    setDisciplines(records || [])
+  }
+
+  useEffect(() => {
+    fetchTypes()
+    fetchFilterOptions()
+    fetchProjects()
+    fetchDisciplines()
+  }, [projectId, schemaName])
+  useEffect(() => {
+    const t = setTimeout(() => setDebouncedSearch(searchTerm), 300)
+    return () => clearTimeout(t)
+  }, [searchTerm])
+  useEffect(() => { setCurrentPage(1) }, [debouncedSearch])
+  useEffect(() => { fetchData() }, [projectId, schemaName, currentPage, debouncedSearch, filters, sortField, sortDirection])
+
+  const handleSort = (field: SortField) => {
+    if (sortField === field) {
+      setSortDirection(sortDirection === 'asc' ? 'desc' : 'asc')
+    } else {
+      setSortField(field)
+      setSortDirection('asc')
+    }
+  }
+
+  const SortIcon = ({ field }: { field: SortField }) => {
+    if (sortField !== field) {
+      return (
+        <svg className="w-4 h-4 text-gray-400" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+          <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M7 16V4m0 0L3 8m4-4l4 4m6 0v12m0 0l4-4m-4 4l-4-4" />
+        </svg>
+      )
+    }
+    return sortDirection === 'asc' ? (
+      <svg className="w-4 h-4 text-blue-600" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+        <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M5 15l7-7 7 7" />
+      </svg>
+    ) : (
+      <svg className="w-4 h-4 text-blue-600" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+        <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 9l-7 7-7-7" />
+      </svg>
+    )
+  }
+
+  const totalPages = Math.max(1, Math.ceil(totalCount / ITEMS_PER_PAGE))
+
+  const openCreateModal = () => {
+    reset({
+      dgt_dtfid: '',
+      dgt_transmittalref: '',
+      dgt_transmittalsubject: '',
+      dgt_discipline: '',
+      dgt_plannedsubmissiondate: '',
+      dgt_plannedapprovaldate: '',
+      dgt_transmittaltype: '',
+      is_long_lead: false,
+      dgt_actualsubmissiondate: '',
+      dgt_actualreturndate: '',
+      dgt_revision: '',
+      dgt_status: '',
+    })
+    setValue('dgt_dbp6bd00projectdataid', projectId)
+    setIsModalOpen(true)
+  }
+
+  const onSubmit = async (formData: EngineeringFormData) => {
+    setSaving(true)
+
+    const insertData = {
+      dgt_dbp6bd00projectdataid: formData.dgt_dbp6bd00projectdataid,
+      dgt_dtfid: formData.dgt_dtfid || null,
+      dgt_transmittalref: formData.dgt_transmittalref || null,
+      dgt_transmittalsubject: formData.dgt_transmittalsubject || null,
+      dgt_discipline: formData.dgt_discipline || null,
+      dgt_plannedsubmissiondate: formData.dgt_plannedsubmissiondate || null,
+      dgt_plannedapprovaldate: formData.dgt_plannedapprovaldate || null,
+      dgt_transmittaltype: formData.dgt_transmittaltype || null,
+      is_long_lead: formData.is_long_lead,
+      dgt_actualsubmissiondate: formData.dgt_actualsubmissiondate || null,
+      dgt_actualreturndate: formData.dgt_actualreturndate || null,
+      dgt_revision: formData.dgt_revision ? parseInt(formData.dgt_revision) : null,
+      dgt_status: formData.dgt_status || null,
+    }
+
+    const { error } = await supabase.from('dbp6_000401_engineering_current').insert(insertData as never)
+
+    if (error) {
+      showError('Failed to create record: ' + error.message)
+    } else {
+      showSuccess('Record created successfully')
+      setIsModalOpen(false)
+      fetchData()
+    }
+
+    setSaving(false)
+  }
+
+  const inputCls = 'w-full px-1.5 py-1 text-xs border border-amber-300 rounded focus:outline-none focus:ring-1 focus:ring-amber-400'
+
+  const formatDate = (dateString: string | null) => {
+    if (!dateString) return '-'
+    return new Date(dateString).toLocaleDateString()
+  }
+
+  const getTypeName = (typeCode: string | null) => {
+    if (!typeCode) return '-'
+    const type = types.find((t) => t.type_code?.toString() === typeCode)
+    if (!type) {
+      console.log('Type not found for code:', typeCode, 'Available types:', types)
+    }
+    return type?.type_name || `Code: ${typeCode}`
+  }
+
+  const getDisciplineName = (code: string | null) => {
+    if (code == null) return '-'
+    return disciplines.find(d => d.discipline_code?.toString() === code)?.discipline_name || `Code: ${code}`
+  }
+
+  const startEdit = (record: Engineering) => {
+    setEditingId(record.dgt_dbp6bd041engineeringid)
+    setEditValues({
+      transmittalref: record.dgt_transmittalref || '',
+      transmittalsubject: record.dgt_transmittalsubject || '',
+      discipline: record.dgt_discipline != null ? String(record.dgt_discipline) : '',
+      transmittaltype: record.dgt_transmittaltype != null ? String(record.dgt_transmittaltype) : '',
+      plannedsubmissiondate: record.dgt_plannedsubmissiondate ? record.dgt_plannedsubmissiondate.split('T')[0] : '',
+      plannedapprovaldate: record.dgt_plannedapprovaldate ? record.dgt_plannedapprovaldate.split('T')[0] : '',
+      actualsubmissiondate: record.dgt_actualsubmissiondate ? record.dgt_actualsubmissiondate.split('T')[0] : '',
+      actualreturndate: record.dgt_actualreturndate ? record.dgt_actualreturndate.split('T')[0] : '',
+      revision: record.dgt_revision != null ? String(record.dgt_revision) : '',
+      status: record.dgt_status || '',
+      mod_id: record.mod_id != null ? String(record.mod_id) : '',
+    })
+  }
+
+  const handleSaveEdit = async () => {
+    if (!editingId) return
+    const { error } = await supabase.from('dbp6_000401_engineering_current').update({
+      dgt_transmittalref: editValues.transmittalref || null,
+      dgt_transmittalsubject: editValues.transmittalsubject || null,
+      dgt_discipline: editValues.discipline || null,
+      dgt_transmittaltype: editValues.transmittaltype || null,
+      dgt_plannedsubmissiondate: editValues.plannedsubmissiondate || null,
+      dgt_plannedapprovaldate: editValues.plannedapprovaldate || null,
+      dgt_actualsubmissiondate: editValues.actualsubmissiondate || null,
+      dgt_actualreturndate: editValues.actualreturndate || null,
+      dgt_revision: editValues.revision ? parseInt(editValues.revision) : null,
+      dgt_status: editValues.status || null,
+      mod_id: editValues.mod_id !== '' ? parseInt(editValues.mod_id) : null,
+    } as never).eq('dgt_dbp6bd041engineeringid', editingId)
+    if (error) { showError('Failed to update: ' + error.message) }
+    else { showSuccess('Record updated'); setEditingId(null); fetchData(); fetchFilterOptions() }
+  }
+
+  const handleDelete = async (recordId: string) => {
+    setDeleting(true)
+    const { error } = await supabase
+      .from('dbp6_000401_engineering_current')
+      .delete()
+      .eq('dgt_dbp6bd041engineeringid', recordId)
+
+    if (error) {
+      showError('Failed to delete record: ' + error.message)
+    } else {
+      showSuccess('Record deleted successfully')
+      fetchData(); fetchFilterOptions()
+    }
+    setDeleting(false)
+    setDeleteConfirm(null)
+  }
+
+  const handleExport = async () => {
+    const db = schemaClient(schemaName)
+    const pageSize = 1000
+    let page = 0
+    const all: Engineering[] = []
+    while (true) {
+      const { data: records, error } = await db
+        .from('dbp6_000401_engineering_current')
+        .select('*')
+        .eq('dgt_dbp6bd00projectdataid', projectId)
+        .order('dgt_transmittalref', { ascending: true })
+        .range(page * pageSize, (page + 1) * pageSize - 1)
+      if (error) { showError('Export failed: ' + error.message); return }
+      all.push(...(records || []))
+      if (!records || records.length < pageSize) break
+      page++
+    }
+    const headers = [
+      'dgt_transmittalref',
+      'dgt_transmittalsubject',
+      'dgt_discipline',
+      'dgt_transmittaltype',
+      'dgt_revision',
+      'dgt_status',
+      'dgt_plannedsubmissiondate',
+      'dgt_plannedapprovaldate',
+      'dgt_actualsubmissiondate',
+      'dgt_actualreturndate',
+      'is_long_lead',
+      'dgt_projectid',
+    ]
+    const rows = all.map(r => [
+      r.dgt_transmittalref,
+      r.dgt_transmittalsubject,
+      r.dgt_discipline,
+      r.dgt_transmittaltype,
+      r.dgt_revision,
+      r.dgt_status,
+      r.dgt_plannedsubmissiondate,
+      r.dgt_plannedapprovaldate,
+      r.dgt_actualsubmissiondate,
+      r.dgt_actualreturndate,
+      r.is_long_lead != null ? String(r.is_long_lead) : null,
+      r.dgt_dbp6bd00projectdataid,
+    ])
+    exportToCsv('engineering-transmittals', headers, rows)
+  }
+
+  const triggerWebhook51 = async () => {
+    setWebhookStatus('loading')
+    try {
+      const params = new URLSearchParams({ project_id: projectTextId, schema: schemaName })
+      await fetch(`https://pmc2p2c.app.n8n.cloud/webhook/70203aa4-fa3c-4a68-a9c4-5454b3ea8dec?${params}`, { method: 'GET' })
+      setWebhookStatus('success')
+    } catch {
+      setWebhookStatus('error')
+    }
+  }
+
+  const handleImport = async (rows: Record<string, string>[]) => {
+    if (rows.length === 0) { showError('No data found in CSV'); return }
+
+    const parseDate = (v: string | undefined): string | null => {
+      if (!v || v.trim() === '') return null
+      const d = new Date(v.trim())
+      return isNaN(d.getTime()) ? null : d.toISOString().split('T')[0]
+    }
+    const nullIfEmpty = (v: string | undefined): string | null => (!v || v.trim() === '' ? null : v.trim())
+
+    // Parse and filter rows with a transmittalref
+    const parsed = rows
+      .filter(r => r.dgt_transmittalref && r.dgt_transmittalref.trim() !== '')
+      .map(r => ({
+        dgt_dbp6bd00projectdataid: projectId,
+        dgt_transmittalref: r.dgt_transmittalref.trim(),
+        dgt_transmittalsubject: nullIfEmpty(r.dgt_transmittalsubject),
+        dgt_discipline: nullIfEmpty(r.dgt_discipline),
+        dgt_transmittaltype: nullIfEmpty(r.dgt_transmittaltype),
+        dgt_revision: r.dgt_revision && r.dgt_revision.trim() !== '' ? parseInt(r.dgt_revision.trim()) : null,
+        dgt_status: nullIfEmpty(r.dgt_status),
+        dgt_plannedsubmissiondate: parseDate(r.dgt_plannedsubmissiondate),
+        dgt_plannedapprovaldate: parseDate(r.dgt_plannedapprovaldate),
+        dgt_actualsubmissiondate: parseDate(r.dgt_actualsubmissiondate),
+        dgt_actualreturndate: parseDate(r.dgt_actualreturndate),
+        is_long_lead: r.is_long_lead ? r.is_long_lead.trim().toLowerCase() === 'true' : false,
+        mod_id: 1,
+      }))
+
+    if (parsed.length === 0) { showError('No valid rows to import'); return }
+
+    // Deduplicate: keep highest dgt_revision per dgt_transmittalref
+    const dedupMap = new Map<string, typeof parsed[number]>()
+    for (const row of parsed) {
+      const existing = dedupMap.get(row.dgt_transmittalref)
+      if (!existing || (row.dgt_revision ?? -Infinity) > (existing.dgt_revision ?? -Infinity)) {
+        dedupMap.set(row.dgt_transmittalref, row)
+      }
+    }
+    const deduped = Array.from(dedupMap.values())
+
+    // Fetch existing refs to distinguish updates vs inserts
+    const db = schemaClient(schemaName)
+    const { data: existing, error: fetchErr } = await db
+      .from('dbp6_000401_engineering_current')
+      .select('dgt_transmittalref')
+      .eq('dgt_dbp6bd00projectdataid', projectId)
+    if (fetchErr) { showError('Import failed: ' + fetchErr.message); return }
+
+    const existingRefs = new Set((existing || []).map((r: { dgt_transmittalref: string | null }) => r.dgt_transmittalref))
+    const toUpdate = deduped.filter(r => existingRefs.has(r.dgt_transmittalref))
+    const toInsert = deduped.filter(r => !existingRefs.has(r.dgt_transmittalref))
+
+    // Upsert into _current on conflict dgt_transmittalref
+    const { error: upsertErr } = await db
+      .from('dbp6_000401_engineering_current')
+      .upsert(deduped as never[], { onConflict: 'dgt_transmittalref' })
+    if (upsertErr) { showError('Import failed: ' + upsertErr.message); return }
+
+    // Sync to _history on conflict (dgt_transmittalref, dgt_revision)
+    const historyRows = deduped.map(r => ({ ...r }))
+    const { error: histErr } = await db
+      .from('dbp6_000401_engineering_history')
+      .upsert(historyRows as never[], { onConflict: 'dgt_transmittalref,dgt_revision' })
+    if (histErr) { showError(`Current updated but history sync failed: ${histErr.message}`); fetchData(); return }
+
+    showSuccess(`${toUpdate.length} updated, ${toInsert.length} inserted`)
+    fetchData()
+  }
+
+  return (
+    <div className="space-y-4">
+      {notification && (
+        <Notification
+          type={notification.type}
+          message={notification.message}
+          onClose={hideNotification}
+        />
+      )}
+
+      <div className="flex flex-col sm:flex-row justify-between gap-4">
+        <div className="flex items-center gap-2 flex-wrap">
+          <div className="w-full sm:w-72">
+            <SearchFilter
+              value={searchTerm}
+              onChange={setSearchTerm}
+              placeholder="Search by Ref, Subject, Discipline..."
+            />
+          </div>
+          {(Object.values(filters).some(v => v !== '') || sortField !== null) && (
+            <button
+              onClick={() => {
+                setFilters({
+                  dgt_transmittalref: '',
+                  dgt_discipline: '',
+                  dgt_transmittaltype: '',
+                  dgt_plannedsubmissiondate: '',
+                  dgt_plannedapprovaldate: '',
+                  dgt_actualsubmissiondate: '',
+                  dgt_actualreturndate: '',
+                  dgt_revision: '',
+                  dgt_status: '',
+                  mod_id: '',
+                })
+                setSortField(null)
+                setSortDirection('asc')
+              }}
+              className="inline-flex items-center px-3 py-2 text-sm font-medium text-white bg-red-600 border border-red-600 rounded-md hover:bg-red-700 transition-colors whitespace-nowrap shadow-sm"
+              title="Clear all filters and sorting"
+            >
+              <svg className="w-4 h-4 mr-1.5" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+                <path strokeLinecap="round" strokeLinejoin="round" d="M6 18L18 6M6 6l12 12" />
+              </svg>
+              Clear All
+              <span className="ml-1.5 px-1.5 py-0.5 text-xs bg-red-800 rounded">
+                {Object.values(filters).filter(v => v !== '').length + (sortField !== null ? 1 : 0)}
+              </span>
+            </button>
+          )}
+          <button
+            onClick={() => setShowTypeLegend(!showTypeLegend)}
+            className="inline-flex items-center px-3 py-2 text-sm font-medium text-gray-700 bg-white border border-gray-300 rounded-md hover:bg-gray-50 transition-colors whitespace-nowrap shadow-sm"
+            title="Show type code reference"
+          >
+            <svg className="w-4 h-4 mr-1.5" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+              <path strokeLinecap="round" strokeLinejoin="round" d="M13 16h-1v-4h-1m1-4h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z" />
+            </svg>
+            Type Legend
+          </button>
+          <button
+            onClick={() => setShowDisciplineLegend(!showDisciplineLegend)}
+            className="inline-flex items-center px-3 py-2 text-sm font-medium text-gray-700 bg-white border border-gray-300 rounded-md hover:bg-gray-50 transition-colors whitespace-nowrap shadow-sm"
+            title="Show discipline code reference"
+          >
+            <svg className="w-4 h-4 mr-1.5" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+              <path strokeLinecap="round" strokeLinejoin="round" d="M13 16h-1v-4h-1m1-4h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z" />
+            </svg>
+            Discipline Legend
+          </button>
+        </div>
+        <div className="flex items-center gap-2">
+          <button
+            onClick={triggerWebhook51}
+            disabled={webhookStatus === 'loading'}
+            className={`inline-flex items-center px-4 py-2 border text-sm font-medium rounded-md shadow-sm transition-colors disabled:cursor-not-allowed ${
+              webhookStatus === 'success' ? 'bg-green-100 text-green-700 border-green-300' :
+              webhookStatus === 'error'   ? 'bg-red-100 text-red-700 border-red-300' :
+              webhookStatus === 'loading' ? 'bg-gray-100 text-gray-400 border-gray-200' :
+              'bg-white text-gray-700 border-gray-300 hover:bg-gray-50'
+            }`}
+          >
+            {webhookStatus === 'loading' && (
+              <svg className="w-4 h-4 mr-2 animate-spin" fill="none" viewBox="0 0 24 24">
+                <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" />
+                <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z" />
+              </svg>
+            )}
+            {webhookStatus === 'success' ? 'Posted!' : webhookStatus === 'error' ? 'Failed' : 'Post Update'}
+          </button>
+          <CsvControls onExport={handleExport} onImport={handleImport} />
+          <button
+            onClick={openCreateModal}
+            className="inline-flex items-center px-4 py-2 border border-transparent text-sm font-medium rounded-md shadow-sm text-white bg-blue-600 hover:bg-blue-700 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-blue-500"
+          >
+            <svg className="w-5 h-5 mr-2" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 4v16m8-8H4" />
+            </svg>
+            Create New
+          </button>
+        </div>
+      </div>
+
+      {showTypeLegend && types.length > 0 && (
+        <div className="bg-blue-50 border border-blue-200 rounded-lg p-4">
+          <h3 className="text-sm font-semibold text-gray-900 mb-2">Transmittal Type Reference</h3>
+          <div className="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-4 lg:grid-cols-5 gap-2">
+            {types.map((type) => (
+              <div key={type.id} className="flex items-center gap-2 text-sm">
+                <span className="font-mono font-semibold text-blue-700 bg-blue-100 px-2 py-1 rounded">
+                  {type.type_code}
+                </span>
+                <span className="text-gray-700">{type.type_name}</span>
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
+
+      {showTypeLegend && types.length === 0 && (
+        <div className="bg-yellow-50 border border-yellow-200 rounded-lg p-4">
+          <p className="text-sm text-yellow-800">No types found in the database. Please add types to the type table.</p>
+        </div>
+      )}
+
+      {showDisciplineLegend && disciplines.length > 0 && (
+        <div className="bg-green-50 border border-green-200 rounded-lg p-4">
+          <h3 className="text-sm font-semibold text-gray-900 mb-2">Discipline Reference</h3>
+          <div className="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-4 lg:grid-cols-5 gap-2">
+            {disciplines.map((d) => (
+              <div key={d.id} className="flex items-center gap-2 text-sm">
+                <span className="font-mono font-semibold text-green-700 bg-green-100 px-2 py-1 rounded">
+                  {d.discipline_code}
+                </span>
+                <span className="text-gray-700">{d.discipline_name}</span>
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
+      {showDisciplineLegend && disciplines.length === 0 && (
+        <div className="bg-yellow-50 border border-yellow-200 rounded-lg p-4">
+          <p className="text-sm text-yellow-800">No disciplines found. Please add disciplines to the discipline table.</p>
+        </div>
+      )}
+
+      {loading ? (
+        <LoadingSpinner />
+      ) : (
+        <div className="bg-white shadow rounded-lg overflow-hidden">
+          {/* Results count */}
+          <div className="px-4 py-2 bg-gray-50 border-b border-gray-200">
+            <span className="text-sm text-gray-600">
+              Showing <span className="font-semibold text-gray-900">{totalCount}</span> record{totalCount !== 1 ? 's' : ''}
+            </span>
+          </div>
+          <div className="overflow-auto max-h-[600px]">
+            <table className="min-w-max w-full divide-y divide-gray-200">
+              <thead className="bg-gray-50 sticky top-0 z-10">
+                <tr className="border-b border-gray-200">
+                  <th className="px-3 py-2 text-left align-top w-36">
+                    <div
+                      className="flex items-center gap-1 text-xs font-medium text-gray-600 uppercase tracking-wide cursor-pointer hover:text-gray-800 whitespace-nowrap"
+                      onClick={() => handleSort('dgt_transmittalref')}
+                    >
+                      Trans. Ref
+                      <SortIcon field="dgt_transmittalref" />
+                    </div>
+                    <div className="mt-1.5" onClick={(e) => e.stopPropagation()}>
+                      <ColumnFilter data={filterData} field="dgt_transmittalref" value={filters.dgt_transmittalref} onChange={(v) => updateFilter('dgt_transmittalref', v)} label="Trans. Ref" />
+                    </div>
+                  </th>
+                  <th className="px-3 py-2 text-left align-top">
+                    <div
+                      className="flex items-center gap-1 text-xs font-medium text-gray-600 uppercase tracking-wide cursor-pointer hover:text-gray-800 whitespace-nowrap"
+                      onClick={() => handleSort('dgt_transmittalsubject')}
+                    >
+                      Subject
+                      <SortIcon field="dgt_transmittalsubject" />
+                    </div>
+                  </th>
+                  <th className="px-3 py-2 text-left align-top w-24">
+                    <div
+                      className="flex items-center gap-1 text-xs font-medium text-gray-600 uppercase tracking-wide cursor-pointer hover:text-gray-800 whitespace-nowrap"
+                      onClick={() => handleSort('dgt_discipline')}
+                    >
+                      Disc.
+                      <SortIcon field="dgt_discipline" />
+                    </div>
+                    <div className="mt-1.5" onClick={(e) => e.stopPropagation()}>
+                      <ColumnFilter data={filterData} field="dgt_discipline" value={filters.dgt_discipline} onChange={(v) => updateFilter('dgt_discipline', v)} label="Discipline" formatValue={(v) => getDisciplineName(v as string)} />
+                    </div>
+                  </th>
+                  <th className="px-3 py-2 text-left align-top w-24">
+                    <div
+                      className="flex items-center gap-1 text-xs font-medium text-gray-600 uppercase tracking-wide cursor-pointer hover:text-gray-800 whitespace-nowrap"
+                      onClick={() => handleSort('dgt_transmittaltype')}
+                    >
+                      Type
+                      <SortIcon field="dgt_transmittaltype" />
+                    </div>
+                    <div className="mt-1.5" onClick={(e) => e.stopPropagation()}>
+                      <ColumnFilter data={filterData} field="dgt_transmittaltype" value={filters.dgt_transmittaltype} onChange={(v) => updateFilter('dgt_transmittaltype', v)} label="Type" formatValue={(v) => getTypeName(v as string)} />
+                    </div>
+                  </th>
+                  <th className="px-3 py-2 text-left align-top w-32">
+                    <div
+                      className="flex items-center gap-1 text-xs font-medium text-gray-600 uppercase tracking-wide cursor-pointer hover:text-gray-800 whitespace-nowrap"
+                      onClick={() => handleSort('dgt_plannedsubmissiondate')}
+                    >
+                      Plan. Sub
+                      <SortIcon field="dgt_plannedsubmissiondate" />
+                    </div>
+                    <div className="mt-1.5" onClick={(e) => e.stopPropagation()}>
+                      <DateColumnFilter data={filterData} field="dgt_plannedsubmissiondate" value={filters.dgt_plannedsubmissiondate} onChange={(v) => updateFilter('dgt_plannedsubmissiondate', v)} label="Planned Sub" />
+                    </div>
+                  </th>
+                  <th className="px-3 py-2 text-left align-top w-32">
+                    <div
+                      className="flex items-center gap-1 text-xs font-medium text-gray-600 uppercase tracking-wide cursor-pointer hover:text-gray-800 whitespace-nowrap"
+                      onClick={() => handleSort('dgt_plannedapprovaldate')}
+                    >
+                      Plan. Appr
+                      <SortIcon field="dgt_plannedapprovaldate" />
+                    </div>
+                    <div className="mt-1.5" onClick={(e) => e.stopPropagation()}>
+                      <DateColumnFilter data={filterData} field="dgt_plannedapprovaldate" value={filters.dgt_plannedapprovaldate} onChange={(v) => updateFilter('dgt_plannedapprovaldate', v)} label="Planned Appr" />
+                    </div>
+                  </th>
+                  <th className="px-3 py-2 text-left align-top w-32">
+                    <div
+                      className="flex items-center gap-1 text-xs font-medium text-gray-600 uppercase tracking-wide cursor-pointer hover:text-gray-800 whitespace-nowrap"
+                      onClick={() => handleSort('dgt_actualsubmissiondate')}
+                    >
+                      Act. Sub
+                      <SortIcon field="dgt_actualsubmissiondate" />
+                    </div>
+                    <div className="mt-1.5" onClick={(e) => e.stopPropagation()}>
+                      <DateColumnFilter data={filterData} field="dgt_actualsubmissiondate" value={filters.dgt_actualsubmissiondate} onChange={(v) => updateFilter('dgt_actualsubmissiondate', v)} label="Act. Sub" />
+                    </div>
+                  </th>
+                  <th className="px-3 py-2 text-left align-top w-32">
+                    <div
+                      className="flex items-center gap-1 text-xs font-medium text-gray-600 uppercase tracking-wide cursor-pointer hover:text-gray-800 whitespace-nowrap"
+                      onClick={() => handleSort('dgt_actualreturndate')}
+                    >
+                      Act. Return
+                      <SortIcon field="dgt_actualreturndate" />
+                    </div>
+                    <div className="mt-1.5" onClick={(e) => e.stopPropagation()}>
+                      <DateColumnFilter data={filterData} field="dgt_actualreturndate" value={filters.dgt_actualreturndate} onChange={(v) => updateFilter('dgt_actualreturndate', v)} label="Act. Return" />
+                    </div>
+                  </th>
+                  <th className="px-3 py-2 text-left align-top w-20">
+                    <div
+                      className="flex items-center gap-1 text-xs font-medium text-gray-600 uppercase tracking-wide cursor-pointer hover:text-gray-800 whitespace-nowrap"
+                      onClick={() => handleSort('dgt_revision')}
+                    >
+                      Rev
+                      <SortIcon field="dgt_revision" />
+                    </div>
+                    <div className="mt-1.5" onClick={(e) => e.stopPropagation()}>
+                      <ColumnFilter data={filterData} field="dgt_revision" value={filters.dgt_revision} onChange={(v) => updateFilter('dgt_revision', v)} label="Revision" />
+                    </div>
+                  </th>
+                  <th className="px-3 py-2 text-left align-top w-28">
+                    <div
+                      className="flex items-center gap-1 text-xs font-medium text-gray-600 uppercase tracking-wide cursor-pointer hover:text-gray-800 whitespace-nowrap"
+                      onClick={() => handleSort('dgt_status')}
+                    >
+                      Status
+                      <SortIcon field="dgt_status" />
+                    </div>
+                    <div className="mt-1.5" onClick={(e) => e.stopPropagation()}>
+                      <ColumnFilter data={filterData} field="dgt_status" value={filters.dgt_status} onChange={(v) => updateFilter('dgt_status', v)} label="Status" />
+                    </div>
+                  </th>
+                  <th className="px-3 py-2 text-left align-top w-16 text-xs font-medium text-gray-600 uppercase tracking-wide whitespace-nowrap">
+                    Long Lead
+                  </th>
+                  <th className="px-3 py-2 text-left align-top w-16">
+                    <div className="text-xs font-medium text-gray-600 uppercase tracking-wide whitespace-nowrap">Mod ID</div>
+                    <div className="mt-1.5" onClick={(e) => e.stopPropagation()}>
+                      <ColumnFilter data={filterData} field="mod_id" value={filters.mod_id} onChange={(v) => updateFilter('mod_id', v)} label="Mod ID" />
+                    </div>
+                  </th>
+                  <th className="px-3 py-2 text-left align-top text-xs font-medium text-gray-600 uppercase tracking-wide w-20">
+                    Actions
+                  </th>
+                </tr>
+              </thead>
+              <tbody className="bg-white divide-y divide-gray-200">
+                {data.length === 0 ? (
+                  <tr>
+                    <td colSpan={13} className="px-6 py-8 text-center text-gray-500">
+                      No records found
+                    </td>
+                  </tr>
+                ) : (
+                  data.map((record) => {
+                    const isEditing = editingId === record.dgt_dbp6bd041engineeringid
+                    return (
+                      <tr key={record.dgt_dbp6bd041engineeringid} className={isEditing ? 'bg-amber-50' : record.mod_id === 1 ? 'bg-yellow-50 hover:bg-yellow-100' : 'hover:bg-gray-50'}>
+                        {isEditing ? (
+                          <>
+                            <td className="px-2 py-1.5"><input type="text" value={editValues.transmittalref} onChange={e => setEditValues(p => ({ ...p, transmittalref: e.target.value }))} className={inputCls} /></td>
+                            <td className="px-2 py-1.5"><input type="text" value={editValues.transmittalsubject} onChange={e => setEditValues(p => ({ ...p, transmittalsubject: e.target.value }))} className={inputCls} /></td>
+                            <td className="px-2 py-1.5"><input type="number" value={editValues.discipline} onChange={e => setEditValues(p => ({ ...p, discipline: e.target.value }))} className={inputCls} /></td>
+                            <td className="px-2 py-1.5">
+                              <select value={editValues.transmittaltype} onChange={e => setEditValues(p => ({ ...p, transmittaltype: e.target.value }))} className={inputCls}>
+                                <option value="">-</option>
+                                {types.map((type) => (
+                                  <option key={type.id} value={type.type_code ?? ''}>{type.type_code} - {type.type_name}</option>
+                                ))}
+                              </select>
+                            </td>
+                            <td className="px-2 py-1.5"><input type="date" value={editValues.plannedsubmissiondate} onChange={e => setEditValues(p => ({ ...p, plannedsubmissiondate: e.target.value }))} className={inputCls} /></td>
+                            <td className="px-2 py-1.5"><input type="date" value={editValues.plannedapprovaldate} onChange={e => setEditValues(p => ({ ...p, plannedapprovaldate: e.target.value }))} className={inputCls} /></td>
+                            <td className="px-2 py-1.5"><input type="date" value={editValues.actualsubmissiondate} onChange={e => setEditValues(p => ({ ...p, actualsubmissiondate: e.target.value }))} className={inputCls} /></td>
+                            <td className="px-2 py-1.5"><input type="date" value={editValues.actualreturndate} onChange={e => setEditValues(p => ({ ...p, actualreturndate: e.target.value }))} className={inputCls} /></td>
+                            <td className="px-2 py-1.5"><input type="number" value={editValues.revision} onChange={e => setEditValues(p => ({ ...p, revision: e.target.value }))} className={inputCls} /></td>
+                            <td className="px-2 py-1.5">
+                              <select value={editValues.status} onChange={e => setEditValues(p => ({ ...p, status: e.target.value }))} onKeyDown={e => { if (e.key === 'Enter') setShowSaveConfirm(true); if (e.key === 'Escape') setShowEditCancelConfirm(true) }} className={inputCls}>
+                                <option value="">-</option>
+                                <option value="A">A</option>
+                                <option value="B">B</option>
+                                <option value="C">C</option>
+                                <option value="D">D</option>
+                                <option value="E">E</option>
+                                <option value="UR">UR</option>
+                              </select>
+                            </td>
+                            <td className="px-3 py-2.5 text-sm text-gray-500 whitespace-nowrap">{record.is_long_lead ? 'Yes' : '-'}</td>
+                            <td className="px-2 py-1.5"><input type="number" value={editValues.mod_id} onChange={e => setEditValues(p => ({ ...p, mod_id: e.target.value }))} className={inputCls} /></td>
+                            <td className="px-3 py-2.5 whitespace-nowrap">
+                              <div className="flex items-center gap-1">
+                                <button onClick={() => setShowSaveConfirm(true)} className="p-1 text-green-600 rounded" title="Save"><svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2.5} d="M5 13l4 4L19 7" /></svg></button>
+                                <button onClick={() => setShowEditCancelConfirm(true)} className="p-1 text-red-500 rounded" title="Cancel"><svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2.5} d="M6 18L18 6M6 6l12 12" /></svg></button>
+                              </div>
+                            </td>
+                          </>
+                        ) : (
+                          <>
+                            <td className="px-3 py-2.5 text-sm text-gray-900">
+                              <div className="whitespace-nowrap" title={record.dgt_transmittalref || '-'}>{record.dgt_transmittalref || '-'}</div>
+                            </td>
+                            <td className="px-3 py-2.5 text-sm text-gray-900">
+                              <div className="whitespace-nowrap" title={record.dgt_transmittalsubject || '-'}>{record.dgt_transmittalsubject || '-'}</div>
+                            </td>
+                            <td className="px-3 py-2.5 text-sm text-gray-900">{getDisciplineName(record.dgt_discipline)}</td>
+                            <td className="px-3 py-2.5 text-sm text-gray-900">{getTypeName(record.dgt_transmittaltype)}</td>
+                            <td className="px-3 py-2.5 text-sm text-gray-900 whitespace-nowrap">{formatDate(record.dgt_plannedsubmissiondate)}</td>
+                            <td className="px-3 py-2.5 text-sm text-gray-900 whitespace-nowrap">{formatDate(record.dgt_plannedapprovaldate)}</td>
+                            <td className="px-3 py-2.5 text-sm text-gray-900 whitespace-nowrap">{formatDate(record.dgt_actualsubmissiondate)}</td>
+                            <td className="px-3 py-2.5 text-sm text-gray-900 whitespace-nowrap">{formatDate(record.dgt_actualreturndate)}</td>
+                            <td className="px-3 py-2.5 text-sm text-gray-900 whitespace-nowrap">{record.dgt_revision ?? '-'}</td>
+                            <td className="px-3 py-2.5 whitespace-nowrap">
+                              <span className={`inline-flex px-2 py-1 text-xs font-semibold rounded-full ${
+                                record.dgt_status === 'A' ? 'bg-green-100 text-green-800'
+                                : record.dgt_status === 'B' ? 'bg-sky-100 text-sky-800'
+                                : record.dgt_status === 'C' ? 'bg-red-100 text-red-700'
+                                : record.dgt_status === 'D' ? 'bg-red-200 text-red-900'
+                                : record.dgt_status === 'UR' ? 'bg-yellow-100 text-yellow-800'
+                                : record.dgt_status === 'E' ? 'bg-gray-200 text-gray-700'
+                                : 'bg-gray-100 text-gray-800'
+                              }`}>{record.dgt_status || '-'}</span>
+                            </td>
+                            <td className="px-3 py-2.5 text-sm text-gray-500 whitespace-nowrap">{record.is_long_lead ? 'Yes' : '-'}</td>
+                            <td className="px-3 py-2.5 text-sm text-gray-500 whitespace-nowrap">{record.mod_id ?? '-'}</td>
+                            <td className="px-3 py-2.5 whitespace-nowrap">
+                              <div className="flex items-center gap-1">
+                                <button onClick={() => startEdit(record)} className="p-1 text-blue-500 rounded" title="Edit"><svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M11 5H6a2 2 0 00-2 2v11a2 2 0 002 2h11a2 2 0 002-2v-5m-1.414-9.414a2 2 0 112.828 2.828L11.828 15H9v-2.828l8.586-8.586z" /></svg></button>
+                                <button onClick={() => setDeleteConfirm(record.dgt_dbp6bd041engineeringid)} className="p-1 text-red-500 rounded" title="Delete"><svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16" /></svg></button>
+                              </div>
+                            </td>
+                          </>
+                        )}
+                      </tr>
+                    )
+                  })
+                )}
+              </tbody>
+            </table>
+          </div>
+          <Pagination
+            currentPage={currentPage}
+            totalPages={totalPages}
+            onPageChange={setCurrentPage}
+            totalItems={totalCount}
+            itemsPerPage={ITEMS_PER_PAGE}
+          />
+        </div>
+      )}
+
+      <Modal
+        isOpen={isModalOpen}
+        onClose={handleCancelModal}
+        title="Create Engineering Record"
+      >
+        <form onSubmit={handleSubmit(onSubmit)} className="space-y-4">
+          <div className="space-y-1">
+            <label className="block text-sm font-medium text-gray-700">
+              Project <span className="text-red-500">*</span>
+            </label>
+            <select
+              {...register('dgt_dbp6bd00projectdataid', { required: 'Project is required' })}
+              className="w-full px-3 py-2 text-sm border border-gray-300 rounded-md focus:outline-none focus:ring-2 focus:ring-blue-500 focus:border-blue-500"
+            >
+              <option value="">-- Select Project --</option>
+              {projects.map((p) => (
+                <option key={p.dgt_dbp6bd00projectdataid} value={p.dgt_dbp6bd00projectdataid}>
+                  {p.dgt_projectname || p.dgt_dbp6bd00projectdataid}
+                </option>
+              ))}
+            </select>
+            {errors.dgt_dbp6bd00projectdataid && (
+              <p className="text-xs text-red-500">{errors.dgt_dbp6bd00projectdataid.message}</p>
+            )}
+          </div>
+
+          <FormField
+            label="DTF ID"
+            type="text"
+            {...register('dgt_dtfid')}
+            error={errors.dgt_dtfid?.message}
+          />
+
+          <FormField
+            label="Transmittal Reference"
+            type="text"
+            {...register('dgt_transmittalref')}
+            error={errors.dgt_transmittalref?.message}
+          />
+
+          <FormField
+            label="Subject"
+            type="text"
+            {...register('dgt_transmittalsubject')}
+            error={errors.dgt_transmittalsubject?.message}
+          />
+
+          <FormField
+            label="Discipline"
+            type="number"
+            {...register('dgt_discipline', {
+              validate: (value) =>
+                !value || !isNaN(Number(value)) || 'Must be a valid number',
+            })}
+            error={errors.dgt_discipline?.message}
+          />
+
+          <div>
+            <label htmlFor="dgt_transmittaltype" className="block text-sm font-medium text-gray-700 mb-1">
+              Transmittal Type
+            </label>
+            <select
+              id="dgt_transmittaltype"
+              {...register('dgt_transmittaltype')}
+              className="w-full px-3 py-2 border border-gray-300 rounded-md shadow-sm focus:outline-none focus:ring-blue-500 focus:border-blue-500"
+            >
+              <option value="">Select type...</option>
+              {types.map((type) => (
+                <option key={type.id} value={type.type_code ?? ''}>
+                  {type.type_code} - {type.type_name}
+                </option>
+              ))}
+            </select>
+            {errors.dgt_transmittaltype?.message && (
+              <p className="mt-1 text-sm text-red-600">{errors.dgt_transmittaltype.message}</p>
+            )}
+            {types.length === 0 && (
+              <p className="mt-1 text-sm text-yellow-600">No types available. Please add types to the type table.</p>
+            )}
+          </div>
+
+          <FormField
+            label="Planned Submission Date"
+            type="date"
+            {...register('dgt_plannedsubmissiondate')}
+            error={errors.dgt_plannedsubmissiondate?.message}
+          />
+
+          <FormField
+            label="Planned Approval Date"
+            type="date"
+            {...register('dgt_plannedapprovaldate')}
+            error={errors.dgt_plannedapprovaldate?.message}
+          />
+
+          <div className="flex items-center gap-2">
+            <input
+              type="checkbox"
+              id="is_long_lead"
+              {...register('is_long_lead')}
+              className="h-4 w-4 rounded border-gray-300 text-blue-600 focus:ring-blue-500"
+            />
+            <label htmlFor="is_long_lead" className="text-sm font-medium text-gray-700">
+              Long Lead Item
+            </label>
+          </div>
+
+          <FormField
+            label="Actual Submission Date"
+            type="date"
+            {...register('dgt_actualsubmissiondate')}
+            error={errors.dgt_actualsubmissiondate?.message}
+          />
+
+          <FormField
+            label="Actual Return Date"
+            type="date"
+            {...register('dgt_actualreturndate')}
+            error={errors.dgt_actualreturndate?.message}
+          />
+
+          <FormField
+            label="Revision"
+            type="number"
+            {...register('dgt_revision', {
+              validate: (value) =>
+                !value || !isNaN(Number(value)) || 'Must be a valid number',
+            })}
+            error={errors.dgt_revision?.message}
+          />
+
+          <div>
+            <label htmlFor="dgt_status" className="block text-sm font-medium text-gray-700 mb-1">
+              Status
+            </label>
+            <select
+              id="dgt_status"
+              {...register('dgt_status')}
+              className="w-full px-3 py-2 border border-gray-300 rounded-md shadow-sm focus:outline-none focus:ring-blue-500 focus:border-blue-500"
+            >
+              <option value="">Select status...</option>
+              <option value="A">A</option>
+              <option value="B">B</option>
+              <option value="C">C</option>
+              <option value="D">D</option>
+              <option value="E">E</option>
+              <option value="UR">UR</option>
+            </select>
+            {errors.dgt_status?.message && (
+              <p className="mt-1 text-sm text-red-600">{errors.dgt_status.message}</p>
+            )}
+          </div>
+
+          <div className="flex justify-end gap-3 pt-4">
+            <button
+              type="button"
+              onClick={handleCancelModal}
+              className="px-4 py-2 text-sm font-medium text-gray-700 bg-white border border-gray-300 rounded-md hover:bg-gray-50 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-blue-500"
+            >
+              Cancel
+            </button>
+            <button
+              type="submit"
+              disabled={saving}
+              className="inline-flex items-center px-4 py-2 text-sm font-medium text-white bg-blue-600 border border-transparent rounded-md hover:bg-blue-700 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-blue-500 disabled:opacity-50"
+            >
+              {saving ? (
+                <>
+                  <svg className="animate-spin -ml-1 mr-2 h-4 w-4 text-white" fill="none" viewBox="0 0 24 24">
+                    <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" />
+                    <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z" />
+                  </svg>
+                  Saving...
+                </>
+              ) : (
+                'Save'
+              )}
+            </button>
+          </div>
+        </form>
+      </Modal>
+
+      <ConfirmDialog
+        isOpen={!!deleteConfirm}
+        title="Delete Record"
+        message="Are you sure you want to delete this record? This action cannot be undone."
+        confirmLabel="Delete"
+        loading={deleting}
+        onConfirm={() => deleteConfirm && handleDelete(deleteConfirm)}
+        onCancel={() => setDeleteConfirm(null)}
+      />
+
+      <ConfirmDialog
+        isOpen={showDiscardConfirm}
+        title="Discard Changes"
+        message="You have unsaved changes. Are you sure you want to discard them?"
+        confirmLabel="Discard"
+        cancelLabel="Keep Editing"
+        variant="warning"
+        onConfirm={() => { setShowDiscardConfirm(false); setIsModalOpen(false); reset() }}
+        onCancel={() => setShowDiscardConfirm(false)}
+      />
+      <ConfirmDialog isOpen={showSaveConfirm} title="Save Changes" message="Save changes to this record?" confirmLabel="Save" cancelLabel="Keep Editing" variant="warning"
+        onConfirm={() => { setShowSaveConfirm(false); handleSaveEdit() }} onCancel={() => setShowSaveConfirm(false)} />
+      <ConfirmDialog isOpen={showEditCancelConfirm} title="Discard Changes" message="Discard your changes?" confirmLabel="Discard" cancelLabel="Keep Editing" variant="warning"
+        onConfirm={() => { setShowEditCancelConfirm(false); setEditingId(null) }} onCancel={() => setShowEditCancelConfirm(false)} />
+    </div>
+  )
+}

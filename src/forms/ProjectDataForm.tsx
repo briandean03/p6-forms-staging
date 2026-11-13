@@ -1,0 +1,1266 @@
+import { REPORT_WEBHOOKS, runReportSync, type SyncReport } from '../lib/reportSync'
+import { useEffect, useMemo, useRef, useState } from 'react'
+import { useForm } from 'react-hook-form'
+import { supabase as supabaseClient, schemaClient } from '../lib/supabase'
+import { ProjectData } from '../types/database'
+import { useNotification } from '../hooks/useNotification'
+import { Notification } from '../components/Notification'
+import { Modal } from '../components/Modal'
+import { ConfirmDialog } from '../components/ConfirmDialog'
+import { FormField } from '../components/FormField'
+import { SearchFilter } from '../components/SearchFilter'
+import { Pagination } from '../components/Pagination'
+import { LoadingSpinner } from '../components/LoadingSpinner'
+import { CsvControls } from '../components/CsvControls'
+import { exportToCsv } from '../utils/csv'
+
+type EditableField = Exclude<keyof ProjectData, 'dgt_dbp6bd00projectdataid'>
+
+interface ProjectDataFormData {
+  dgt_projectname: string
+  dgt_projectid: string
+  dgt_employersname: string
+  dgt_contractorsname: string
+  dgt_consultantsname: string
+  dgt_pmcsname: string
+  dgt_location: string
+  dgt_contractvalue: string
+  dgt_projectstartdate: string
+  dgt_projectenddate: string
+  dgt_reportingstartingdate: string
+  dgt_datadate: string
+  dgt_elapsedduration: string
+  dgt_eotawarded: string
+  dgt_current_weeknum: string
+  timezoneruleversionnumber: string
+  utcconversiontimezonecode: string
+  owningbusinessunit: string
+}
+
+type EditingCell = {
+  recordId: string
+  field: EditableField
+} | null
+
+type WebhookStatus = 'idle' | 'loading' | 'success' | 'error'
+
+const WEBHOOKS = [
+  { id: '51', label: 'Webhook 51', url: 'https://pmc2p2c.app.n8n.cloud/webhook/70203aa4-fa3c-4a68-a9c4-5454b3ea8dec' },
+  { id: '52', label: 'Webhook 52', url: 'https://pmc2p2c.app.n8n.cloud/webhook/ec7b88dc-e7f3-44df-8fde-4c9beaa14ba8' },
+  { id: '53', label: 'Webhook 53', url: 'https://pmc2p2c.app.n8n.cloud/webhook/ec7b88dc-e7f3-44df-8fde-4c9beaa14ba8' },
+  { id: '55', label: 'Webhook 55', url: 'https://pmc2p2c.app.n8n.cloud/webhook/95f75293-0ad2-49e4-b7d1-b75abd0803ba' },
+  { id: '62', label: 'Webhook 62', url: 'https://pmc2p2c.app.n8n.cloud/webhook/35e376a6-155d-4cb7-9ba2-b38e1533f15d', method: 'POST' as const },
+  { id: '146', label: 'Generate Weekly Activity Report', url: 'https://pmc2p2c.app.n8n.cloud/webhook/47c2c01f-c886-4071-9a7a-f0591fefe6ss', method: 'POST' as const },
+] as const
+
+interface WeeklyReportRow {
+  id: number
+  report_section: 'LAST_WEEK_PROGRESS' | 'NEXT_WEEK_LOOKAHEAD'
+  activity_id: string
+  activity_name: string | null
+  current_week_num: number
+  reporting_status: string | null
+  criticality: string | null
+  current_percent_complete: number | null
+  previous_percent_complete: number | null
+  progress_achieved_percentage_points: number | null
+  forecast_percent_complete_end_next_week: number | null
+  work_type_name: string | null
+  activity_discipline_name: string | null
+  observation: string | null
+  created_at: string
+}
+
+const DATE_FIELDS = new Set([
+  'dgt_projectstartdate',
+  'dgt_projectenddate',
+  'dgt_reportingstartingdate',
+  'dgt_datadate',
+])
+const NUMBER_FIELDS = new Set(['dgt_contractvalue', 'dgt_current_weeknum'])
+const NON_EDITABLE_FIELDS = new Set<string>([])
+
+function FieldRow({ label, children }: { label: string; children: React.ReactNode }) {
+  return (
+    <div className="flex items-start gap-3 py-1.5">
+      <span className="text-xs font-medium text-gray-500 w-36 shrink-0 pt-1 leading-tight">{label}</span>
+      <div className="flex-1 min-w-0">{children}</div>
+    </div>
+  )
+}
+
+function SectionHeading({ children }: { children: React.ReactNode }) {
+  return (
+    <p className="text-xs font-semibold text-gray-400 uppercase tracking-wider mb-2">{children}</p>
+  )
+}
+
+export function ProjectDataForm({ projectId, projectTextId, schemaName }: { projectId: string; projectTextId: string; schemaName: string }) {
+  const supabase = schemaClient(schemaName)
+  const [data, setData] = useState<ProjectData[]>([])
+  const [loading, setLoading] = useState(true)
+  const [saving, setSaving] = useState(false)
+  const [isModalOpen, setIsModalOpen] = useState(false)
+  const [deleteConfirm, setDeleteConfirm] = useState<string | null>(null)
+  const [deleting, setDeleting] = useState(false)
+  const [showDiscardConfirm, setShowDiscardConfirm] = useState(false)
+  const [webhookModal, setWebhookModal] = useState(false)
+  const [webhookStatus, setWebhookStatus] = useState<Record<string, WebhookStatus>>({
+    '51': 'idle', '52': 'idle', '53': 'idle', '55': 'idle', '62': 'idle', '146': 'idle',
+  })
+  const [reportSyncRunning, setReportSyncRunning] = useState(false)
+  const [reportSyncSteps, setReportSyncSteps] = useState<Record<string, string>>({})
+  const [reportJobId, setReportJobId] = useState<string | null>(null)
+  const [reportJobStatus, setReportJobStatus] = useState<{ status: string; progress: string | null; error_message: string | null } | null>(null)
+  const reportSyncAbort = useRef<AbortController | null>(null)
+  useEffect(() => {
+    setReportSyncRunning(false)
+    setReportSyncSteps({})
+    setReportJobId(null)
+    setReportJobStatus(null)
+    return () => { reportSyncAbort.current?.abort(); reportSyncAbort.current = null }
+  }, [schemaName, projectId, projectTextId])
+
+  // Subscribe to Realtime updates on the report job row so the UI reflects
+  // server-side progress without any browser polling.
+  useEffect(() => {
+    if (!reportJobId) return
+
+    function applyJobRow(row: { status: string; progress: string | null; error_message: string | null }) {
+      setReportJobStatus(row)
+      if (row.status === 'completed') {
+        setReportSyncSteps(prev => ({ ...prev, '151': 'accepted', '150': 'accepted' }))
+        showSuccess('Report ready')
+      } else if (row.status === 'failed') {
+        setReportSyncSteps(prev => ({ ...prev, '151': 'error' }))
+      }
+    }
+
+    const channel = supabaseClient
+      .channel(`report-job-${reportJobId}`)
+      .on('postgres_changes', {
+        event: 'UPDATE',
+        schema: 'public',
+        table: 'dbp6_0008_report_jobs',
+        filter: `job_id=eq.${reportJobId}`,
+      }, (payload) => {
+        applyJobRow(payload.new as { status: string; progress: string | null; error_message: string | null })
+      })
+      .subscribe()
+
+    // Fetch current row immediately after subscribing to handle the race condition
+    // where the job reached 'completed' before the Realtime channel connected.
+    supabaseClient
+      .from('dbp6_0008_report_jobs')
+      .select('status, progress, error_message')
+      .eq('job_id', reportJobId)
+      .single()
+      .then(({ data }) => { if (data) applyJobRow(data) })
+
+    return () => { supabaseClient.removeChannel(channel) }
+  }, [reportJobId])
+  const [reportPolling, setReportPolling] = useState(false)
+  const [reportRows, setReportRows] = useState<WeeklyReportRow[]>([])
+  const [reportWeek, setReportWeek] = useState<number | null>(null)
+  const [reportSectionOpen, setReportSectionOpen] = useState<Record<string, boolean>>({
+    LAST_WEEK_PROGRESS: true, NEXT_WEEK_LOOKAHEAD: true,
+  })
+  const pollCountRef = useRef(0)
+  const reportPanelRef = useRef<HTMLDivElement>(null)
+  const [editingCell, setEditingCell] = useState<EditingCell>(null)
+  const [cellValue, setCellValue] = useState('')
+  const [currentPage, setCurrentPage] = useState(1)
+  const [searchTerm, setSearchTerm] = useState('')
+  const [reportEditingCell, setReportEditingCell] = useState<{ rowId: number; field: keyof WeeklyReportRow } | null>(null)
+  const [reportCellValue, setReportCellValue] = useState('')
+  const [reportSaving, setReportSaving] = useState(false)
+
+  const { notification, hideNotification, showSuccess, showError } = useNotification()
+  const {
+    register,
+    handleSubmit,
+    reset,
+    watch,
+    formState: { errors, isDirty },
+  } = useForm<ProjectDataFormData>()
+
+  const watchedStartDate = watch('dgt_projectstartdate')
+
+  const ITEMS_PER_PAGE = 15
+
+  const handleCancelModal = () => {
+    if (isDirty) {
+      setShowDiscardConfirm(true)
+    } else {
+      setIsModalOpen(false)
+    }
+  }
+
+  const fetchData = async () => {
+    setLoading(true)
+    try {
+      let query = supabase
+        .from('dbp6_0000_projectdata')
+        .select('*')
+        .order('dgt_dbp6bd00projectdataid', { ascending: false })
+
+      if (projectId) {
+        query = query.eq('dgt_dbp6bd00projectdataid', projectId)
+      }
+
+      const { data: records, error } = await query
+
+      if (error) {
+        showError('Failed to fetch data: ' + error.message)
+      } else {
+        setData(records || [])
+      }
+    } catch (err) {
+      showError('Failed to fetch data: ' + String(err))
+    }
+    setLoading(false)
+  }
+
+  useEffect(() => {
+    fetchData()
+  }, [])
+
+  const fetchReport = async () => {
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const { data: rows, error } = await (supabase as any)
+      .from('dbp6_0008_weekly_activity_report')
+      .select('id, report_section, activity_id, activity_name, current_week_num, reporting_status, criticality, current_percent_complete, previous_percent_complete, progress_achieved_percentage_points, forecast_percent_complete_end_next_week, work_type_name, activity_discipline_name, observation, created_at')
+      .order('created_at', { ascending: false })
+      .limit(200)
+    if (error) {
+      console.error('[fetchReport] error:', error)
+      showError('Failed to load report: ' + (error.message ?? String(error)))
+      return []
+    }
+    if (rows && rows.length > 0) {
+      setReportRows(rows)
+      setReportWeek(rows[0].current_week_num)
+    }
+    return rows ?? []
+  }
+
+  useEffect(() => {
+    if (!reportPolling) return
+    pollCountRef.current = 0
+
+    const poll = async () => {
+      pollCountRef.current += 1
+      if (pollCountRef.current > 24) { setReportPolling(false); return }
+      const rows = await fetchReport()
+      if (rows.length > 0) {
+        setReportPolling(false)
+        setTimeout(() => reportPanelRef.current?.scrollIntoView({ behavior: 'smooth', block: 'start' }), 100)
+      }
+    }
+
+    const interval = setInterval(poll, 5000)
+    return () => clearInterval(interval)
+  }, [reportPolling, schemaName])
+
+  const getInputType = (field: string): 'text' | 'date' | 'number' => {
+    if (DATE_FIELDS.has(field)) return 'date'
+    if (NUMBER_FIELDS.has(field)) return 'number'
+    return 'text'
+  }
+
+  // dgt_datadate helpers — stores previous day at 23:00 UTC so P6 reads 07:00 GST
+  const encodeDataDate = (dateStr: string): string => {
+    const [year, month, day] = dateStr.split('-').map(Number)
+    return new Date(Date.UTC(year, month - 1, day - 1, 23, 0, 0)).toISOString()
+  }
+  const decodeDataDate = (stored: string): string => {
+    const d = new Date(stored)
+    return new Date(Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), d.getUTCDate() + 1))
+      .toISOString().slice(0, 10)
+  }
+
+  const formatCellValue = (field: string, value: string | number | null | undefined) => {
+    if (value === null || value === undefined) return '-'
+    if (field === 'dgt_datadate') return new Date(decodeDataDate(value as string)).toLocaleDateString()
+    if (DATE_FIELDS.has(field)) return new Date(value as string).toLocaleDateString()
+    return String(value)
+  }
+
+  const openCreateModal = () => {
+    reset()
+    setIsModalOpen(true)
+  }
+
+  const onSubmit = async (formData: ProjectDataFormData) => {
+    setSaving(true)
+    const insertData: Record<string, string | number | null> = {}
+    for (const key of Object.keys(formData) as (keyof ProjectDataFormData)[]) {
+      const val = formData[key]
+      if (!val) {
+        insertData[key] = null
+      } else if (key === 'dgt_datadate') {
+        insertData[key] = encodeDataDate(val)
+      } else if (NUMBER_FIELDS.has(key)) {
+        insertData[key] = parseInt(val) || null
+      } else {
+        insertData[key] = val
+      }
+    }
+
+    try {
+      const { error } = await supabase.from('dbp6_0000_projectdata').insert(insertData as never)
+      if (error) {
+        showError('Failed to create record: ' + error.message)
+      } else {
+        showSuccess('Project posted successfully')
+        setIsModalOpen(false)
+        fetchData()
+      }
+    } catch (err) {
+      showError('Failed to create record: ' + String(err))
+    }
+    setSaving(false)
+  }
+
+  const startEditing = (
+    recordId: string,
+    field: EditableField,
+    currentValue: string | number | null | undefined
+  ) => {
+    setEditingCell({ recordId, field })
+    if (field === 'dgt_datadate') {
+      setCellValue(currentValue ? decodeDataDate(currentValue as string) : '')
+    } else if (DATE_FIELDS.has(field)) {
+      setCellValue(
+        currentValue ? new Date(currentValue as string).toISOString().slice(0, 10) : ''
+      )
+    } else {
+      setCellValue(currentValue?.toString() || '')
+    }
+  }
+
+  const saveInlineEdit = async (recordId: string, field: EditableField) => {
+    let updateValue: string | number | null = cellValue || null
+    if (field === 'dgt_datadate' && cellValue) {
+      updateValue = encodeDataDate(cellValue)
+    } else if (NUMBER_FIELDS.has(field) && cellValue) {
+      updateValue = parseInt(cellValue) || null
+    }
+
+    try {
+      const { error } = await supabase
+        .from('dbp6_0000_projectdata')
+        .update({ [field]: updateValue } as never)
+        .eq('dgt_dbp6bd00projectdataid', recordId)
+
+      if (error) {
+        showError('Failed to update: ' + error.message)
+      } else {
+        setData((prev) =>
+          prev.map((item) =>
+            item.dgt_dbp6bd00projectdataid === recordId ? { ...item, [field]: updateValue } : item
+          )
+        )
+        showSuccess('Updated successfully')
+      }
+    } catch (err) {
+      showError('Failed to update: ' + String(err))
+    }
+    setEditingCell(null)
+    setCellValue('')
+  }
+
+  const handleKeyDown = (e: React.KeyboardEvent, recordId: string, field: EditableField) => {
+    if (e.key === 'Enter') saveInlineEdit(recordId, field)
+    else if (e.key === 'Escape') {
+      setEditingCell(null)
+      setCellValue('')
+    }
+  }
+
+  const handleDelete = async (recordId: string) => {
+    setDeleting(true)
+    try {
+      const { error } = await supabase
+        .from('dbp6_0000_projectdata')
+        .delete()
+        .eq('dgt_dbp6bd00projectdataid', recordId)
+
+      if (error) {
+        showError('Failed to delete: ' + error.message)
+      } else {
+        setData((prev) => prev.filter((item) => item.dgt_dbp6bd00projectdataid !== recordId))
+        showSuccess('Project deleted successfully')
+      }
+    } catch (err) {
+      showError('Failed to delete: ' + String(err))
+    }
+    setDeleting(false)
+    setDeleteConfirm(null)
+  }
+
+  const startReportEdit = (rowId: number, field: keyof WeeklyReportRow, currentValue: string | number | null) => {
+    setReportEditingCell({ rowId, field })
+    setReportCellValue(currentValue?.toString() ?? '')
+  }
+
+  const saveReportCell = async (rowId: number, field: keyof WeeklyReportRow) => {
+    setReportSaving(true)
+    const isNumeric = field === 'forecast_percent_complete_end_next_week'
+    const updateValue: string | number | null = reportCellValue === ''
+      ? null
+      : isNumeric ? parseFloat(reportCellValue) || null : reportCellValue
+
+    try {
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const { error } = await (supabase as any)
+        .from('dbp6_0008_weekly_activity_report')
+        .update({ [field]: updateValue })
+        .eq('id', rowId)
+
+      if (error) {
+        showError('Failed to update: ' + error.message)
+      } else {
+        setReportRows(prev =>
+          prev.map(r => r.id === rowId ? { ...r, [field]: updateValue } : r)
+        )
+        showSuccess('Updated successfully')
+      }
+    } catch (err) {
+      showError('Failed to update: ' + String(err))
+    }
+    setReportSaving(false)
+    setReportEditingCell(null)
+    setReportCellValue('')
+  }
+
+  const handleReportCellKeyDown = (e: React.KeyboardEvent, rowId: number, field: keyof WeeklyReportRow) => {
+    if (e.key === 'Enter') saveReportCell(rowId, field)
+    else if (e.key === 'Escape') { setReportEditingCell(null); setReportCellValue('') }
+  }
+
+  const handleReportSync = async () => {
+    if (reportSyncAbort.current || Object.values(webhookStatus).includes('loading')) return
+    const controller = new AbortController()
+    reportSyncAbort.current = controller
+    setReportSyncRunning(true)
+    setReportSyncSteps({})
+    try {
+      if (!projectId || !projectTextId || !schemaName || schemaName === 'public') throw new Error('Select a project before generating reports.')
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const client = schemaClient(schemaName) as any
+      const { data: project, error: projectError } = await client.from('dbp6_0000_projectdata')
+        .select('dgt_current_weeknum').eq('dgt_dbp6bd00projectdataid', projectId).abortSignal(controller.signal).maybeSingle()
+      if (projectError) throw new Error('Cannot read the current project week: ' + projectError.message)
+      if (project?.dgt_current_weeknum == null) throw new Error('The selected project has no current reporting week.')
+      const readReport = async (): Promise<SyncReport | null> => {
+        const { data: report, error } = await client.from('dbp6_0008_weekly_reports_calculations')
+          .select('report_id, updated_at').eq('project_id', projectTextId)
+          .eq('week_num', project.dgt_current_weeknum).eq('report_type', 'Weekly Progress Report')
+          .order('updated_at', { ascending: false }).limit(1).abortSignal(controller.signal).maybeSingle()
+        if (error) throw new Error('Cannot read calculation report metadata: ' + error.message)
+        return report
+      }
+
+      await runReportSync({
+        schema: schemaName, projectId: projectTextId, signal: controller.signal,
+        readReport,
+        onStep: (id, status) => { if (!controller.signal.aborted) setReportSyncSteps(prev => ({ ...prev, [id]: status })) },
+        onJobCreated: (jobId) => { setReportJobId(jobId) },
+      })
+      if (!controller.signal.aborted) showSuccess('Workflows 149, 149B and 152 accepted. Widget generation is running on the server — step 150 will fire automatically.')
+    } catch (error) {
+      if (!controller.signal.aborted) showError(error instanceof Error ? error.message : String(error))
+    } finally {
+      if (reportSyncAbort.current === controller) {
+        reportSyncAbort.current = null
+        setReportSyncRunning(false)
+      }
+    }
+  }
+
+  const triggerWebhook = async (id: string, url: string, method: 'GET' | 'POST' = 'GET') => {
+    if (reportSyncAbort.current) return
+    setWebhookStatus(prev => ({ ...prev, [id]: 'loading' }))
+    try {
+      if (id === '146') {
+        await fetch(url, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ flow_parameters: { schema: schemaName } }),
+        })
+        setWebhookStatus(prev => ({ ...prev, [id]: 'success' }))
+        setReportPolling(true)
+      } else {
+        const params = new URLSearchParams({ project_id: projectTextId, schema: schemaName, t: Date.now().toString() })
+        await fetch(`${url}?${params}`, { method })
+        setWebhookStatus(prev => ({ ...prev, [id]: 'success' }))
+      }
+    } catch {
+      setWebhookStatus(prev => ({ ...prev, [id]: 'error' }))
+    }
+  }
+
+  const filteredAndSortedData = useMemo(() => {
+    let result = data
+
+    if (searchTerm) {
+      const term = searchTerm.toLowerCase()
+      result = result.filter(
+        (item) =>
+          item.dgt_projectname?.toLowerCase().includes(term) ||
+          item.dgt_projectid?.toLowerCase().includes(term) ||
+          item.project_id?.toLowerCase().includes(term) ||
+          item.dgt_employersname?.toLowerCase().includes(term) ||
+          item.dgt_location?.toLowerCase().includes(term)
+      )
+    }
+
+    return result
+  }, [data, searchTerm])
+
+  const paginatedData = useMemo(() => {
+    const startIndex = (currentPage - 1) * ITEMS_PER_PAGE
+    return filteredAndSortedData.slice(startIndex, startIndex + ITEMS_PER_PAGE)
+  }, [filteredAndSortedData, currentPage])
+
+  const totalPages = Math.ceil(filteredAndSortedData.length / ITEMS_PER_PAGE)
+
+  // Renders an inline-editable cell for the vertical layout
+  const renderCell = (record: ProjectData, field: keyof ProjectData) => {
+    const isEditing =
+      editingCell?.recordId === record.dgt_dbp6bd00projectdataid &&
+      editingCell?.field === field
+    const rawValue = record[field]
+
+    // Read-only fields
+    if (NON_EDITABLE_FIELDS.has(field)) {
+      return (
+        <span className="text-sm text-gray-800 px-1">
+          {formatCellValue(field, rawValue as string | number | null)}
+        </span>
+      )
+    }
+
+    // Data date — calendar restricted to weekly intervals from project start date
+    if (field === 'dgt_datadate') {
+      const startDate = record.dgt_projectstartdate
+        ? new Date(record.dgt_projectstartdate).toISOString().slice(0, 10)
+        : undefined
+
+      return isEditing ? (
+        <input
+          type="date"
+          value={cellValue}
+          onChange={(e) => setCellValue(e.target.value)}
+          onBlur={() => saveInlineEdit(record.dgt_dbp6bd00projectdataid, 'dgt_datadate')}
+          onKeyDown={(e) => handleKeyDown(e, record.dgt_dbp6bd00projectdataid, 'dgt_datadate')}
+          min={startDate}
+          className="px-2 py-1 text-sm border border-blue-500 rounded focus:outline-none focus:ring-1 focus:ring-blue-500"
+          autoFocus
+        />
+      ) : (
+        <button
+          type="button"
+          onClick={() => startEditing(record.dgt_dbp6bd00projectdataid, 'dgt_datadate', rawValue as string | null)}
+          className="inline-flex items-center gap-1.5 px-2 py-1 rounded hover:bg-blue-50 group text-left"
+          title="Click to select data date"
+        >
+          <span className="text-sm text-gray-800">
+            {formatCellValue(field, rawValue as string | null)}
+          </span>
+          <svg className="w-3.5 h-3.5 text-gray-400 opacity-0 group-hover:opacity-100 transition-opacity shrink-0" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+            <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M8 7V3m8 4V3m-9 8h10M5 21h14a2 2 0 002-2V7a2 2 0 00-2-2H5a2 2 0 00-2 2v12a2 2 0 002 2z" />
+          </svg>
+        </button>
+      )
+    }
+
+    const inputType = getInputType(field)
+
+    return isEditing ? (
+      <input
+        type={inputType}
+        step={inputType === 'number' ? 1 : undefined}
+        value={cellValue}
+        onChange={(e) => setCellValue(e.target.value)}
+        onBlur={() => saveInlineEdit(record.dgt_dbp6bd00projectdataid, field as EditableField)}
+        onKeyDown={(e) => handleKeyDown(e, record.dgt_dbp6bd00projectdataid, field as EditableField)}
+        className={`px-2 py-1 text-sm border border-blue-500 rounded focus:outline-none focus:ring-1 focus:ring-blue-500 ${
+          inputType === 'date' ? 'w-36' : inputType === 'number' ? 'w-28' : 'w-full max-w-sm'
+        }`}
+        autoFocus
+      />
+    ) : (
+      <button
+        type="button"
+        onClick={() => startEditing(record.dgt_dbp6bd00projectdataid, field as EditableField, rawValue as string | number | null)}
+        className="inline-flex items-center gap-1.5 px-2 py-1 rounded hover:bg-blue-50 group text-left"
+        title="Click to edit"
+      >
+        <span className="text-sm text-gray-800">
+          {formatCellValue(field, rawValue as string | number | null)}
+        </span>
+        <svg className="w-3 h-3 text-gray-400 opacity-0 group-hover:opacity-100 transition-opacity shrink-0" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+          <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M15.232 5.232l3.536 3.536m-2.036-5.036a2.5 2.5 0 113.536 3.536L6.5 21.036H3v-3.572L16.732 3.732z" />
+        </svg>
+      </button>
+    )
+  }
+
+  const handleExport = () => {
+    const headers = ['dgt_projectname', 'dgt_projectid', 'dgt_employersname', 'dgt_contractorsname', 'dgt_consultantsname', 'dgt_pmcsname', 'dgt_location', 'dgt_contractvalue', 'dgt_projectstartdate', 'dgt_projectenddate', 'dgt_reportingstartingdate', 'dgt_elapsedduration', 'dgt_eotawarded']
+    const rows = data.map(r => [r.dgt_projectname, r.dgt_projectid, r.dgt_employersname, r.dgt_contractorsname, r.dgt_consultantsname, r.dgt_pmcsname, r.dgt_location, r.dgt_contractvalue, r.dgt_projectstartdate, r.dgt_projectenddate, r.dgt_reportingstartingdate, r.dgt_elapsedduration, r.dgt_eotawarded])
+    exportToCsv('project-data', headers, rows)
+  }
+
+  const handleImport = async (rows: Record<string, string>[]) => {
+    if (rows.length === 0) { showError('No data found in CSV'); return }
+    const inserts = rows
+      .filter(r => r.dgt_projectname)
+      .map(({ dgt_projectname, dgt_projectid, dgt_employersname, dgt_contractorsname, dgt_consultantsname, dgt_pmcsname, dgt_location, dgt_contractvalue, dgt_projectstartdate, dgt_projectenddate, dgt_reportingstartingdate, dgt_elapsedduration, dgt_eotawarded }) => ({
+        dgt_projectname: dgt_projectname || null,
+        dgt_projectid: dgt_projectid || null,
+        dgt_employersname: dgt_employersname || null,
+        dgt_contractorsname: dgt_contractorsname || null,
+        dgt_consultantsname: dgt_consultantsname || null,
+        dgt_pmcsname: dgt_pmcsname || null,
+        dgt_location: dgt_location || null,
+        dgt_contractvalue: Number(dgt_contractvalue) || null,
+        dgt_projectstartdate: dgt_projectstartdate || null,
+        dgt_projectenddate: dgt_projectenddate || null,
+        dgt_reportingstartingdate: dgt_reportingstartingdate || null,
+        dgt_elapsedduration: dgt_elapsedduration || null,
+        dgt_eotawarded: dgt_eotawarded || null,
+      }))
+    if (inserts.length === 0) { showError('No valid rows to import'); return }
+    const { error } = await supabase.from('dbp6_0000_projectdata').insert(inserts as never)
+    if (error) { showError('Import failed: ' + error.message) }
+    else { showSuccess(`${inserts.length} records imported`); fetchData() }
+  }
+
+  if (loading) return <LoadingSpinner />
+
+  const anyWebhookLoading = reportSyncRunning || Object.values(webhookStatus).some(s => s === 'loading')
+
+  return (
+    <div className="space-y-4">
+      {notification && (
+        <Notification type={notification.type} message={notification.message} onClose={hideNotification} />
+      )}
+
+      {/* Toolbar */}
+      <div className="flex justify-between items-center">
+        <h2 className="text-2xl font-bold text-gray-900">Project Data</h2>
+        <div className="flex gap-2 items-center">
+          <button
+            disabled={reportSyncRunning}
+            onClick={() => {
+              setWebhookStatus({ '51': 'idle', '52': 'idle', '53': 'idle', '55': 'idle', '62': 'idle', '146': 'idle' })
+              setWebhookModal(true)
+            }}
+            className="px-4 py-2 bg-gray-100 text-gray-700 text-sm font-medium rounded hover:bg-gray-200 flex items-center gap-2"
+          >
+            <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15" />
+            </svg>
+            Sync
+          </button>
+          <button
+            onClick={async () => {
+              const rows = await fetchReport()
+              if (rows.length === 0) showError('No report found. Generate one first via Sync → Generate Weekly Activity Report.')
+              else setTimeout(() => reportPanelRef.current?.scrollIntoView({ behavior: 'smooth', block: 'start' }), 100)
+            }}
+            className="px-4 py-2 bg-indigo-50 text-indigo-700 text-sm font-medium rounded hover:bg-indigo-100 flex items-center gap-2 border border-indigo-200"
+          >
+            <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 17v-2m3 2v-4m3 4v-6m2 10H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z" />
+            </svg>
+            View Report
+          </button>
+          <CsvControls onExport={handleExport} onImport={handleImport} />
+          <button
+            onClick={openCreateModal}
+            className="px-4 py-2 bg-blue-600 text-white text-sm font-medium rounded hover:bg-blue-700"
+          >
+            Post Project
+          </button>
+        </div>
+      </div>
+
+      {/* Search / filter bar */}
+      <div className="flex items-center gap-3 bg-white p-3 rounded-lg shadow-sm border border-gray-200">
+        <div className="flex-1">
+          <SearchFilter
+            placeholder="Search by project name, ID, employer or location..."
+            value={searchTerm}
+            onChange={setSearchTerm}
+          />
+        </div>
+        {searchTerm && (
+          <button
+            onClick={() => { setSearchTerm(''); setCurrentPage(1) }}
+            className="px-3 py-1.5 text-xs font-medium text-gray-700 bg-gray-100 hover:bg-gray-200 rounded"
+          >
+            Clear
+          </button>
+        )}
+        <span className="text-sm text-gray-500 whitespace-nowrap">
+          {filteredAndSortedData.length} of {data.length} record{data.length !== 1 ? 's' : ''}
+        </span>
+      </div>
+
+      {/* Vertical project cards */}
+      {paginatedData.length === 0 ? (
+        <div className="bg-white rounded-lg shadow-sm border border-gray-200 px-6 py-12 text-center text-gray-500">
+          {data.length === 0
+            ? 'No projects found. Create one by clicking "Post Project".'
+            : 'No matching records.'}
+        </div>
+      ) : (
+        <div className="space-y-4">
+          {paginatedData.map((record) => (
+            <div
+              key={record.dgt_dbp6bd00projectdataid}
+              className="bg-white rounded-lg shadow-sm border border-gray-200 overflow-hidden"
+            >
+              {/* Card header */}
+              <div className="flex items-center justify-between px-5 py-3 bg-gray-50 border-b border-gray-200">
+                <div className="flex items-center gap-3">
+                  <h3 className="font-semibold text-gray-900">
+                    {record.dgt_projectname || 'Unnamed Project'}
+                  </h3>
+                  {record.dgt_projectid && (
+                    <span className="px-2 py-0.5 text-xs font-medium bg-blue-100 text-blue-700 rounded-full">
+                      {record.dgt_projectid}
+                    </span>
+                  )}
+                </div>
+                <button
+                  onClick={() => setDeleteConfirm(record.dgt_dbp6bd00projectdataid)}
+                  className="inline-flex items-center gap-1 text-sm font-medium text-red-600 hover:text-red-800"
+                >
+                  <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16" />
+                  </svg>
+                  Delete
+                </button>
+              </div>
+
+              {/* Card body — two-column sections */}
+              <div className="grid grid-cols-1 lg:grid-cols-2 divide-y lg:divide-y-0 lg:divide-x divide-gray-100">
+
+                {/* Left column */}
+                <div className="divide-y divide-gray-100">
+                  {/* Project Info */}
+                  <div className="px-5 py-4">
+                    <SectionHeading>Project Info</SectionHeading>
+                    <div className="space-y-0.5">
+                      <FieldRow label="Project Name">{renderCell(record, 'dgt_projectname')}</FieldRow>
+                      <FieldRow label="Project ID">{renderCell(record, 'dgt_projectid')}</FieldRow>
+                      <FieldRow label="Internal ID">
+                        <span className="text-sm text-gray-800 px-1">{record.project_id || '-'}</span>
+                      </FieldRow>
+                      <FieldRow label="P6 Code">{renderCell(record, 'current_p6_project_code')}</FieldRow>
+                      <FieldRow label="Location">{renderCell(record, 'dgt_location')}</FieldRow>
+                    </div>
+                  </div>
+
+                  {/* Parties */}
+                  <div className="px-5 py-4">
+                    <SectionHeading>Parties</SectionHeading>
+                    <div className="space-y-0.5">
+                      <FieldRow label="Employer">{renderCell(record, 'dgt_employersname')}</FieldRow>
+                      <FieldRow label="Contractor">{renderCell(record, 'dgt_contractorsname')}</FieldRow>
+                      <FieldRow label="Consultant">{renderCell(record, 'dgt_consultantsname')}</FieldRow>
+                      <FieldRow label="PMCS">{renderCell(record, 'dgt_pmcsname')}</FieldRow>
+                    </div>
+                  </div>
+                </div>
+
+                {/* Right column */}
+                <div className="divide-y divide-gray-100">
+                  {/* Dates */}
+                  <div className="px-5 py-4">
+                    <SectionHeading>Dates</SectionHeading>
+                    <div className="space-y-0.5">
+                      <FieldRow label="Start Date">{renderCell(record, 'dgt_projectstartdate')}</FieldRow>
+                      <FieldRow label="End Date">{renderCell(record, 'dgt_projectenddate')}</FieldRow>
+                      <FieldRow label="Reporting Start">{renderCell(record, 'dgt_reportingstartingdate')}</FieldRow>
+                      <FieldRow label="Data Date">{renderCell(record, 'dgt_datadate')}</FieldRow>
+                      <FieldRow label="Week #">{renderCell(record, 'dgt_current_weeknum')}</FieldRow>
+                    </div>
+                  </div>
+
+                  {/* Contract */}
+                  <div className="px-5 py-4">
+                    <SectionHeading>Contract</SectionHeading>
+                    <div className="space-y-0.5">
+                      <FieldRow label="Contract Value">{renderCell(record, 'dgt_contractvalue')}</FieldRow>
+                      <FieldRow label="Elapsed Duration">{renderCell(record, 'dgt_elapsedduration')}</FieldRow>
+                      <FieldRow label="EOT Awarded">{renderCell(record, 'dgt_eotawarded')}</FieldRow>
+                    </div>
+                  </div>
+
+                  {/* System */}
+                  <div className="px-5 py-4">
+                    <SectionHeading>System</SectionHeading>
+                    <div className="space-y-0.5">
+                      <FieldRow label="Owning Unit">{renderCell(record, 'owningbusinessunit')}</FieldRow>
+                      <FieldRow label="Timezone Rule">{renderCell(record, 'timezoneruleversionnumber')}</FieldRow>
+                      <FieldRow label="UTC Conversion">{renderCell(record, 'utcconversiontimezonecode')}</FieldRow>
+                    </div>
+                  </div>
+                </div>
+              </div>
+            </div>
+          ))}
+        </div>
+      )}
+
+      <Pagination
+        currentPage={currentPage}
+        totalPages={totalPages}
+        onPageChange={setCurrentPage}
+        totalItems={filteredAndSortedData.length}
+        itemsPerPage={ITEMS_PER_PAGE}
+      />
+
+      <ConfirmDialog
+        isOpen={!!deleteConfirm}
+        title="Delete Project"
+        message="Are you sure you want to delete this project? This action cannot be undone."
+        confirmLabel="Delete"
+        loading={deleting}
+        onConfirm={() => deleteConfirm && handleDelete(deleteConfirm)}
+        onCancel={() => setDeleteConfirm(null)}
+      />
+
+      {/* Create Project Modal */}
+      <Modal isOpen={isModalOpen} onClose={handleCancelModal} title="Create New Project">
+        <form onSubmit={handleSubmit(onSubmit)} className="space-y-4">
+          <div className="grid grid-cols-2 gap-4">
+            <FormField
+              label="Project Name"
+              type="text"
+              {...register('dgt_projectname', { required: 'Required' })}
+              error={errors.dgt_projectname?.message}
+            />
+            <FormField
+              label="Project ID"
+              type="text"
+              {...register('dgt_projectid', { required: 'Required' })}
+              error={errors.dgt_projectid?.message}
+            />
+          </div>
+
+          <FormField label="Employer's Name" type="text" {...register('dgt_employersname')} />
+
+          <div className="grid grid-cols-2 gap-4">
+            <FormField label="Contractor's Name" type="text" {...register('dgt_contractorsname')} />
+            <FormField label="Consultant's Name" type="text" {...register('dgt_consultantsname')} />
+          </div>
+
+          <div className="grid grid-cols-2 gap-4">
+            <FormField label="PMCS Name" type="text" {...register('dgt_pmcsname')} />
+            <FormField label="Location" type="text" {...register('dgt_location')} />
+          </div>
+
+          <div className="grid grid-cols-2 gap-4">
+            <FormField label="Contract Value" type="number" {...register('dgt_contractvalue')} />
+            <FormField label="Week Number" type="number" {...register('dgt_current_weeknum')} />
+          </div>
+
+          <div className="grid grid-cols-2 gap-4">
+            <FormField label="Project Start Date" type="date" {...register('dgt_projectstartdate')} />
+            <FormField label="Project End Date" type="date" {...register('dgt_projectenddate')} />
+          </div>
+
+          <div className="grid grid-cols-2 gap-4">
+            <FormField label="Reporting Start Date" type="date" {...register('dgt_reportingstartingdate')} />
+
+            {/* Data Date — calendar starting from project start date */}
+            <div className="space-y-1">
+              <label className="block text-sm font-medium text-gray-700">Data Date</label>
+              <input
+                type="date"
+                min={watchedStartDate || undefined}
+                {...register('dgt_datadate')}
+                className="w-full px-3 py-2 text-sm border border-gray-300 rounded-md focus:outline-none focus:ring-2 focus:ring-blue-500 focus:border-blue-500"
+              />
+              {errors.dgt_datadate && (
+                <p className="text-xs text-red-500">{errors.dgt_datadate.message}</p>
+              )}
+            </div>
+          </div>
+
+          <div className="grid grid-cols-2 gap-4">
+            <FormField label="Elapsed Duration" type="text" {...register('dgt_elapsedduration')} />
+            <FormField label="EOT Awarded" type="text" {...register('dgt_eotawarded')} />
+          </div>
+
+          <div className="grid grid-cols-2 gap-4">
+            <FormField label="Timezone Rule Version" type="text" {...register('timezoneruleversionnumber')} />
+            <FormField label="UTC Conversion Timezone" type="text" {...register('utcconversiontimezonecode')} />
+          </div>
+
+          <FormField label="Owning Business Unit" type="text" {...register('owningbusinessunit')} />
+
+          <div className="flex justify-end gap-2 pt-4 border-t border-gray-200">
+            <button
+              type="button"
+              onClick={handleCancelModal}
+              className="px-4 py-2 text-gray-700 bg-gray-200 rounded hover:bg-gray-300"
+            >
+              Cancel
+            </button>
+            <button
+              type="submit"
+              disabled={saving}
+              className="px-4 py-2 bg-blue-600 text-white rounded hover:bg-blue-700 disabled:bg-blue-400"
+            >
+              {saving ? 'Posting...' : 'Post Project'}
+            </button>
+          </div>
+        </form>
+      </Modal>
+
+      {/* Webhook Sync Modal */}
+      <Modal isOpen={webhookModal} onClose={() => setWebhookModal(false)} title="Sync / Update Webhooks">
+        <div className="space-y-3 py-2">
+          <p className="text-sm text-gray-500 mb-4">Trigger an n8n workflow to sync project data.</p>
+          <div className="p-4 rounded-lg border border-indigo-200 bg-indigo-50 space-y-2">
+            <p className="text-sm font-medium">Generate weekly report and dashboard</p>
+            <p className="text-xs text-gray-600">Current project week · 149 → 149B → 152 → 151 → 150. Accepted requests may continue processing in n8n.</p>
+            {reportSyncRunning && (
+              <p className="text-xs text-gray-500">
+                Widget generation is running on the server — you can safely close this window.
+                Step 150 will run automatically when all widget outputs are confirmed.
+              </p>
+            )}
+            <button onClick={handleReportSync} disabled={anyWebhookLoading}
+              className="px-4 py-2 text-sm rounded bg-indigo-600 text-white disabled:opacity-50 disabled:cursor-not-allowed">
+              {reportSyncRunning ? 'Running report sequence…' : 'Run report sequence'}
+            </button>
+            <ol className="text-xs space-y-1" aria-live="polite">
+              {REPORT_WEBHOOKS.map(step => {
+                const status = reportSyncSteps[step.id]
+                const waitLabel = step.id === '151'
+                  ? 'Dispatched; waiting for widget outputs and A3 layout'
+                  : 'Accepted; waiting for calculation report'
+                return (
+                  <li key={step.id}>
+                    {step.id}: {step.label}: {status === 'waiting' ? waitLabel : status ?? 'Not started'}
+                    {step.id === '151' && reportJobStatus?.progress && (
+                      <span className="block text-gray-500 pl-2">{reportJobStatus.progress}</span>
+                    )}
+                    {step.id === '151' && reportJobStatus?.error_message && (
+                      <span className="block text-red-500 pl-2">{reportJobStatus.error_message}</span>
+                    )}
+                  </li>
+                )
+              })}
+            </ol>
+          </div>
+          {WEBHOOKS.map(({ id, label, url, ...rest }) => {
+            const method = 'method' in rest ? (rest as { method: 'GET' | 'POST' }).method : 'GET'
+            const status = webhookStatus[id]
+            return (
+              <div key={id} className="flex items-center justify-between p-4 rounded-lg border border-gray-200 bg-gray-50">
+                <span className="text-sm font-medium text-gray-700">{label}</span>
+                <button
+                  onClick={() => triggerWebhook(id, url, method)}
+                  disabled={anyWebhookLoading}
+                  className={`flex items-center gap-2 px-4 py-1.5 text-sm font-medium rounded-lg transition-colors disabled:cursor-not-allowed ${
+                    status === 'success' ? 'bg-green-100 text-green-700 border border-green-300' :
+                    status === 'error'   ? 'bg-red-100 text-red-700 border border-red-300' :
+                    status === 'loading' ? 'bg-gray-100 text-gray-400 border border-gray-200' :
+                    'bg-blue-600 text-white hover:bg-blue-700'
+                  }`}
+                >
+                  {status === 'loading' && (
+                    <svg className="w-4 h-4 animate-spin" fill="none" viewBox="0 0 24 24">
+                      <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" />
+                      <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8v8z" />
+                    </svg>
+                  )}
+                  {status === 'success' && <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M5 13l4 4L19 7" /></svg>}
+                  {status === 'error'   && <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M6 18L18 6M6 6l12 12" /></svg>}
+                  {status === 'idle' ? 'Run' : status === 'loading' ? 'Running…' : status === 'success' ? 'Success' : 'Failed: Retry'}
+                </button>
+              </div>
+            )
+          })}
+        </div>
+      </Modal>
+
+      <ConfirmDialog
+        isOpen={showDiscardConfirm}
+        title="Discard Changes"
+        message="You have unsaved changes. Are you sure you want to discard them?"
+        confirmLabel="Discard"
+        cancelLabel="Keep Editing"
+        variant="warning"
+        onConfirm={() => { setShowDiscardConfirm(false); setIsModalOpen(false); reset() }}
+        onCancel={() => setShowDiscardConfirm(false)}
+      />
+
+      {/* ── Weekly Activity Report Panel ───────────────────────────────────── */}
+      {(reportPolling || reportRows.length > 0) && (
+        <div ref={reportPanelRef} className="bg-white rounded-xl border border-indigo-200 shadow-sm overflow-hidden">
+          {/* Header */}
+          <div className="flex items-center justify-between px-5 py-3 bg-indigo-50 border-b border-indigo-100">
+            <div className="flex items-center gap-3">
+              <svg className="w-5 h-5 text-indigo-600" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 17v-2m3 2v-4m3 4v-6m2 10H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z" />
+              </svg>
+              <h3 className="text-sm font-semibold text-indigo-800">
+                Weekly Activity Report{reportWeek !== null ? ` — Week ${reportWeek}` : ''}
+              </h3>
+            </div>
+            <div className="flex items-center gap-2">
+              {reportPolling && (
+                <span className="flex items-center gap-1.5 text-xs text-indigo-600 font-medium">
+                  <svg className="w-3.5 h-3.5 animate-spin" fill="none" viewBox="0 0 24 24">
+                    <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" />
+                    <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8v8z" />
+                  </svg>
+                  Processing…
+                </span>
+              )}
+              {!reportPolling && reportRows.length > 0 && (
+                <button
+                  onClick={() => fetchReport()}
+                  className="text-xs text-indigo-600 hover:text-indigo-800 font-medium flex items-center gap-1"
+                >
+                  <svg className="w-3.5 h-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15" />
+                  </svg>
+                  Refresh
+                </button>
+              )}
+            </div>
+          </div>
+
+          {reportPolling && reportRows.length === 0 ? (
+            <div className="px-5 py-10 text-center text-sm text-gray-400">
+              n8n is generating the report — this usually takes 1–2 minutes…
+            </div>
+          ) : (
+            <div className="divide-y divide-gray-100">
+              {(['LAST_WEEK_PROGRESS', 'NEXT_WEEK_LOOKAHEAD'] as const).map(section => {
+                const sectionRows = reportRows.filter(r => r.report_section === section)
+                const sectionLabel = section === 'LAST_WEEK_PROGRESS' ? 'Last Week Progress' : 'Next Week Lookahead'
+                const isOpen = reportSectionOpen[section]
+
+                const critBadge = (c: string | null) => {
+                  const cfg: Record<string, string> = {
+                    CRITICAL: 'bg-red-100 text-red-700',
+                    NEAR_CRITICAL: 'bg-amber-100 text-amber-700',
+                    NON_CRITICAL: 'bg-green-100 text-green-700',
+                    UNKNOWN: 'bg-gray-100 text-gray-500',
+                  }
+                  if (!c) return null
+                  return <span className={`inline-block px-1.5 py-0.5 rounded text-xs font-semibold ${cfg[c] ?? 'bg-gray-100 text-gray-500'}`}>{c.replace('_', ' ')}</span>
+                }
+
+                const statusBadge = (s: string | null) => {
+                  if (!s) return <span className="text-gray-400 text-xs">—</span>
+                  const cfg: Record<string, string> = {
+                    PROGRESSED: 'bg-blue-100 text-blue-700',
+                    COMPLETED: 'bg-green-100 text-green-700',
+                    PARTIAL_COMPLETION: 'bg-amber-100 text-amber-700',
+                    FULL_COMPLETION: 'bg-emerald-100 text-emerald-700',
+                  }
+                  return <span className={`inline-block px-1.5 py-0.5 rounded text-xs font-semibold ${cfg[s] ?? 'bg-gray-100 text-gray-500'}`}>{s.replace('_', ' ')}</span>
+                }
+
+                const pct = (v: number | null) => v != null ? `${Number(v).toFixed(1)}%` : '—'
+
+                return (
+                  <div key={section}>
+                    <button
+                      onClick={() => setReportSectionOpen(prev => ({ ...prev, [section]: !prev[section] }))}
+                      className="w-full flex items-center justify-between px-5 py-3 bg-gray-50 hover:bg-gray-100 transition-colors text-left"
+                    >
+                      <span className="text-xs font-semibold text-gray-600 uppercase tracking-wider">{sectionLabel}</span>
+                      <div className="flex items-center gap-2">
+                        <span className="text-xs text-gray-400">{sectionRows.length} activit{sectionRows.length !== 1 ? 'ies' : 'y'}</span>
+                        <svg className={`w-4 h-4 text-gray-400 transition-transform ${isOpen ? '' : '-rotate-90'}`} fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                          <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 9l-7 7-7-7" />
+                        </svg>
+                      </div>
+                    </button>
+
+                    {isOpen && (
+                      <div className="overflow-x-auto">
+                        {sectionRows.length === 0 ? (
+                          <p className="px-5 py-4 text-sm text-gray-400">No activities in this section.</p>
+                        ) : (
+                          <table className="w-full text-xs">
+                            <thead>
+                              <tr className="bg-gray-50 border-b border-gray-200">
+                                <th className="px-3 py-2 text-left font-semibold text-gray-500 whitespace-nowrap">Activity ID</th>
+                                <th className="px-3 py-2 text-left font-semibold text-gray-500">Activity Name</th>
+                                <th className="px-3 py-2 text-left font-semibold text-gray-500 whitespace-nowrap">Work Type</th>
+                                <th className="px-3 py-2 text-left font-semibold text-gray-500 whitespace-nowrap">Discipline</th>
+                                {section === 'LAST_WEEK_PROGRESS' ? (
+                                  <>
+                                    <th className="px-3 py-2 text-right font-semibold text-gray-500 whitespace-nowrap">Prev %</th>
+                                    <th className="px-3 py-2 text-right font-semibold text-gray-500 whitespace-nowrap">Curr %</th>
+                                    <th className="px-3 py-2 text-right font-semibold text-gray-500 whitespace-nowrap">Progress</th>
+                                    <th className="px-3 py-2 text-left font-semibold text-gray-500">Status</th>
+                                  </>
+                                ) : (
+                                  <>
+                                    <th className="px-3 py-2 text-right font-semibold text-gray-500 whitespace-nowrap">Curr %</th>
+                                    <th className="px-3 py-2 text-right font-semibold text-gray-500 whitespace-nowrap">Forecast %</th>
+                                    <th className="px-3 py-2 text-left font-semibold text-gray-500">Completion</th>
+                                  </>
+                                )}
+                                <th className="px-3 py-2 text-left font-semibold text-gray-500">Criticality</th>
+                                <th className="px-3 py-2 text-left font-semibold text-gray-500">Observation</th>
+                              </tr>
+                            </thead>
+                            <tbody className="divide-y divide-gray-50">
+                              {sectionRows.map(row => {
+                                const isEditingField = (field: keyof WeeklyReportRow) =>
+                                  reportEditingCell?.rowId === row.id && reportEditingCell.field === field
+
+                                const EditableTextCell = ({ field, className = '' }: { field: keyof WeeklyReportRow; className?: string }) => {
+                                  const val = row[field] as string | null
+                                  if (isEditingField(field)) {
+                                    return (
+                                      <td className={`px-1 py-1 ${className}`}>
+                                        <input
+                                          autoFocus
+                                          type="text"
+                                          value={reportCellValue}
+                                          onChange={e => setReportCellValue(e.target.value)}
+                                          onKeyDown={e => handleReportCellKeyDown(e, row.id, field)}
+                                          onBlur={() => saveReportCell(row.id, field)}
+                                          disabled={reportSaving}
+                                          className="w-full px-2 py-1 text-xs border border-blue-400 rounded focus:outline-none focus:ring-1 focus:ring-blue-500"
+                                        />
+                                      </td>
+                                    )
+                                  }
+                                  return (
+                                    <td
+                                      className={`px-3 py-2 cursor-pointer hover:bg-blue-50 group ${className}`}
+                                      onClick={() => startReportEdit(row.id, field, val)}
+                                      title="Click to edit"
+                                    >
+                                      <span className="text-gray-500 group-hover:text-gray-700">{val ?? '—'}</span>
+                                    </td>
+                                  )
+                                }
+
+                                const EditableSelectCell = ({ field, options }: { field: keyof WeeklyReportRow; options: string[] }) => {
+                                  const val = row[field] as string | null
+                                  if (isEditingField(field)) {
+                                    return (
+                                      <td className="px-1 py-1">
+                                        <select
+                                          autoFocus
+                                          value={reportCellValue}
+                                          onChange={e => setReportCellValue(e.target.value)}
+                                          onBlur={() => saveReportCell(row.id, field)}
+                                          onKeyDown={e => { if (e.key === 'Escape') { setReportEditingCell(null); setReportCellValue('') } }}
+                                          disabled={reportSaving}
+                                          className="w-full px-1 py-0.5 text-xs border border-blue-400 rounded focus:outline-none focus:ring-1 focus:ring-blue-500"
+                                        >
+                                          <option value="">—</option>
+                                          {options.map(o => <option key={o} value={o}>{o.replace(/_/g, ' ')}</option>)}
+                                        </select>
+                                      </td>
+                                    )
+                                  }
+                                  return (
+                                    <td
+                                      className="px-3 py-2 cursor-pointer hover:bg-blue-50 group"
+                                      onClick={() => startReportEdit(row.id, field, val)}
+                                      title="Click to edit"
+                                    >
+                                      {val ? (
+                                        <span className="group-hover:opacity-80">{critBadge(val) ?? statusBadge(val)}</span>
+                                      ) : (
+                                        <span className="text-gray-300 group-hover:text-gray-400">—</span>
+                                      )}
+                                    </td>
+                                  )
+                                }
+
+                                const EditableNumberCell = ({ field }: { field: keyof WeeklyReportRow }) => {
+                                  const val = row[field] as number | null
+                                  if (isEditingField(field)) {
+                                    return (
+                                      <td className="px-1 py-1">
+                                        <input
+                                          autoFocus
+                                          type="number"
+                                          min={0}
+                                          max={100}
+                                          step={0.1}
+                                          value={reportCellValue}
+                                          onChange={e => setReportCellValue(e.target.value)}
+                                          onKeyDown={e => handleReportCellKeyDown(e, row.id, field)}
+                                          onBlur={() => saveReportCell(row.id, field)}
+                                          disabled={reportSaving}
+                                          className="w-20 px-2 py-1 text-xs border border-blue-400 rounded focus:outline-none focus:ring-1 focus:ring-blue-500 text-right"
+                                        />
+                                      </td>
+                                    )
+                                  }
+                                  return (
+                                    <td
+                                      className="px-3 py-2 text-right cursor-pointer hover:bg-blue-50 group"
+                                      onClick={() => startReportEdit(row.id, field, val)}
+                                      title="Click to edit"
+                                    >
+                                      <span className="text-indigo-700 font-semibold group-hover:opacity-80">{pct(val)}</span>
+                                    </td>
+                                  )
+                                }
+
+                                return (
+                                  <tr key={row.id} className="hover:bg-gray-50 transition-colors">
+                                    <td className="px-3 py-2 font-mono text-gray-600 whitespace-nowrap">{row.activity_id}</td>
+                                    <td className="px-3 py-2 text-gray-800 max-w-xs">{row.activity_name ?? '—'}</td>
+                                    <td className="px-3 py-2 text-gray-600 whitespace-nowrap">{row.work_type_name ?? '—'}</td>
+                                    <td className="px-3 py-2 text-gray-600 whitespace-nowrap">{row.activity_discipline_name ?? '—'}</td>
+                                    {section === 'LAST_WEEK_PROGRESS' ? (
+                                      <>
+                                        <td className="px-3 py-2 text-right text-gray-600">{pct(row.previous_percent_complete)}</td>
+                                        <td className="px-3 py-2 text-right text-gray-800 font-medium">{pct(row.current_percent_complete)}</td>
+                                        <td className="px-3 py-2 text-right text-emerald-700 font-semibold">{pct(row.progress_achieved_percentage_points)}</td>
+                                        <EditableSelectCell field="reporting_status" options={['PROGRESSED','COMPLETED','PARTIAL_COMPLETION','FULL_COMPLETION']} />
+                                      </>
+                                    ) : (
+                                      <>
+                                        <td className="px-3 py-2 text-right text-gray-600">{pct(row.current_percent_complete)}</td>
+                                        <EditableNumberCell field="forecast_percent_complete_end_next_week" />
+                                        <EditableSelectCell field="reporting_status" options={['PROGRESSED','COMPLETED','PARTIAL_COMPLETION','FULL_COMPLETION']} />
+                                      </>
+                                    )}
+                                    <EditableSelectCell field="criticality" options={['CRITICAL','NEAR_CRITICAL','NON_CRITICAL','UNKNOWN']} />
+                                    <EditableTextCell field="observation" className="max-w-sm" />
+                                  </tr>
+                                )
+                              })}
+                            </tbody>
+                          </table>
+                        )}
+                      </div>
+                    )}
+                  </div>
+                )
+              })}
+            </div>
+          )}
+        </div>
+      )}
+    </div>
+  )
+}

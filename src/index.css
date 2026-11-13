@@ -1,0 +1,767 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/* Custom scrollbar for better UX */
+::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+
+::-webkit-scrollbar-track {
+  background: #f1f1f1;
+  border-radius: 4px;
+}
+
+::-webkit-scrollbar-thumb {
+  background: #c1c1c1;
+  border-radius: 4px;
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background: #a1a1a1;
+}
+
+/* Smooth transitions for interactive elements */
+button,
+a,
+input,
+select {
+  transition: all 0.2s ease;
+}
+
+/* Focus visible for accessibility */
+:focus-visible {
+  outline: 2px solid #3b82f6;
+  outline-offset: 2px;
+}
+
+/* Table row hover effect */
+tbody tr:hover {
+  transition: background-color 0.15s ease;
+}
+
+/* Animation for modals */
+.modal-enter {
+  opacity: 0;
+  transform: scale(0.95);
+}
+
+.modal-enter-active {
+  opacity: 1;
+  transform: scale(1);
+  transition: opacity 0.2s ease, transform 0.2s ease;
+}
+
+/* ── Print / PDF styles ────────────────────────────────────────────────────── */
+
+/* Default page: A4 portrait (used by the weekly report and any other print target).
+   The A3 dashboard uses a named @page so it no longer needs to override this. */
+@page {
+  size: A4 portrait;
+  margin: 14mm 13mm;
+}
+
+/* Named page for the A3 landscape dashboard — zero margin so the fixed 420×297mm
+   sheet element fills the page exactly, matching the reference HTML approach */
+@page a3dash {
+  size: A3 landscape;
+  margin: 0;
+}
+
+/* Named page for landscape appendix sections in the weekly report */
+@page wr-landscape {
+  size: A4 landscape;
+  margin: 12mm;
+}
+
+@media print {
+  /* ── 1. Hide all App chrome — sidebar, header, footer, toolbars, interactive controls ── */
+  .no-print,
+  button,
+  select,
+  input[type="range"],
+  input[type="text"],
+  input[type="search"] {
+    display: none !important;
+  }
+
+  /* ── 2. Reset the page shell so content starts on page 1 with no blank ── */
+  html, body {
+    width: 100% !important;
+    height: auto !important;
+    overflow: visible !important;
+    background: #f1f5f9 !important;
+    margin: 0 !important;
+    padding: 0 !important;
+    -webkit-print-color-adjust: exact;
+    print-color-adjust: exact;
+  }
+
+  /* App root — remove flex/overflow constraints */
+  #root,
+  .flex.h-screen,
+  .flex.flex-col.flex-1 {
+    display: block !important;
+    height: auto !important;
+    overflow: visible !important;
+    width: 100% !important;
+  }
+
+  /* Main content area — remove screen padding */
+  .print-main {
+    padding: 0 !important;
+    overflow: visible !important;
+    height: auto !important;
+    max-height: none !important;
+  }
+
+  /* ── 3. Each dashboard page = one PDF page ── */
+  .print-page {
+    display: block !important;
+    width: 100% !important;
+    max-width: 100% !important;
+    overflow: visible !important;
+    page-break-after: always;
+    break-after: page;
+    page-break-inside: avoid;
+    break-inside: avoid;
+    margin: 0 !important;
+    padding: 0 !important;
+    box-sizing: border-box !important;
+  }
+
+  .print-page:last-child {
+    page-break-after: avoid;
+    break-after: avoid;
+  }
+
+  /* ── 4. A3 single-page export ────────────────────────────────────────────────
+     .a3-print-root switches to the named @page a3dash (A3 landscape, margin:0).
+     .a3-page is the fixed 420mm × 297mm sheet — it fills the page exactly.
+     overflow:hidden prevents content from bleeding; break-after:avoid keeps it
+     on a single page. */
+  .a3-print-root {
+    width: var(--dashboard-paper-width, 100%) !important;
+    overflow: visible !important;
+    display: block !important;
+    page: a3dash;
+  }
+
+  .a3-page {
+    width: 420mm !important;
+    height: 297mm !important;
+    box-sizing: border-box !important;
+    overflow: hidden !important;
+    page-break-inside: avoid !important;
+    break-inside: avoid !important;
+    page-break-after: avoid !important;
+    break-after: avoid !important;
+    box-shadow: none !important;
+  }
+
+  /* ── 5. Colours and backgrounds must render ── */
+  * {
+    -webkit-print-color-adjust: exact !important;
+    print-color-adjust: exact !important;
+    color-adjust: exact !important;
+  }
+
+  /* ── 6. Fix scrollable containers — expand to show all content ── */
+  [style*="overflow-y: auto"],
+  [style*="overflow-y:auto"],
+  [style*="overflowY: auto"],
+  [style*="overflow: auto"],
+  [style*="max-height"] {
+    overflow: visible !important;
+    max-height: none !important;
+    height: auto !important;
+  }
+
+  /* ── 7. Sticky elements become static so they don't repeat on every page ── */
+  [style*="position: sticky"],
+  [style*="position:sticky"] {
+    position: static !important;
+  }
+
+  /* ── 8. Individual widget cards — don't split across pages ── */
+  .print-page .rounded-xl,
+  .print-page .rounded-lg,
+  .a3-print-root .rounded-xl,
+  .a3-print-root .rounded-lg {
+    break-inside: avoid;
+    page-break-inside: avoid;
+  }
+
+  /* ── 9. Recharts — stable chart rendering ── */
+
+  /* .print-chart wraps every ResponsiveContainer.
+     - Never split a chart across a page break
+     - ResponsiveContainer receives a numeric height prop directly in JSX
+       so we must NOT set height here — only guard overflow and breaks */
+  .print-chart {
+    overflow: visible !important;
+    break-inside: avoid !important;
+    page-break-inside: avoid !important;
+    display: block !important;
+  }
+
+  /* recharts-wrapper MUST keep position:relative — the SVG surface and
+     tooltip layer are absolutely positioned relative to it */
+  .recharts-wrapper {
+    position: relative !important;
+    overflow: visible !important;
+  }
+
+  /* Recharts sets explicit pixel width/height on the wrapper and SVG via JS.
+     We must not override those — just ensure they stay visible */
+  .recharts-wrapper > svg {
+    overflow: visible !important;
+  }
+
+  /* Tooltip — useless on print, hide it to avoid ghost boxes */
+  .recharts-tooltip-wrapper {
+    display: none !important;
+  }
+
+  /* Legend and surface — keep visible */
+  .recharts-surface,
+  .recharts-legend-wrapper {
+    overflow: visible !important;
+  }
+
+  /* Active dot markers — hide on print (no hover interaction, and they
+     can render huge if Recharts captures them mid-animation) */
+  .recharts-active-dot {
+    display: none !important;
+  }
+
+  /* All SVG elements — no clipping */
+  svg {
+    overflow: visible !important;
+  }
+
+  /* ── 10. Tables — full width, headers repeat, rows don't split ── */
+  table {
+    width: 100% !important;
+    border-collapse: collapse !important;
+  }
+
+  thead {
+    display: table-header-group !important;
+  }
+
+  tr {
+    break-inside: avoid;
+    page-break-inside: avoid;
+  }
+
+  /* ── 11. Flex/grid layouts — keep width without breaking children ── */
+  .flex-1 {
+    flex: 1 1 auto !important;
+  }
+
+  .min-w-0 {
+    min-width: 0 !important;
+  }
+}
+
+/* ── A3 print preparation — applied by html.a3-printing class in preparePrint() ──
+   These rules mirror the @media print rules but apply during the beforeprint
+   measurement pass so preparePrint() sees the correct layout dimensions.
+   Each rule is a separate block (combining html.a3-printing with @media print
+   in a single selector group is invalid CSS). */
+
+/* Pin .a3-print-root to A3 printable width for measurement */
+html.a3-printing .a3-print-root {
+  display: block;
+  width: var(--dashboard-paper-width, 1526px);
+  overflow: visible;
+}
+
+/* Remove transform from .a3-page during measurement */
+html.a3-printing .a3-page {
+  transform-origin: top left;
+  overflow: visible;
+}
+
+/* Hide interactive chrome during measurement so it doesn't inflate scrollHeight */
+html.a3-printing .no-print {
+  display: none !important;
+}
+
+/* Trade Schedule: expand scroll container for measurement */
+html.a3-printing [data-widget="trade-schedule"] {
+  overflow: visible;
+  max-height: none;
+  height: auto;
+}
+
+/* Trade row: widen label column */
+html.a3-printing [data-trade-row] {
+  grid-template-columns: 80px 1fr 46px;
+}
+
+/* Trade label: allow wrap instead of truncate */
+html.a3-printing [data-trade-row] .truncate {
+  overflow: visible;
+  text-overflow: clip;
+  white-space: normal;
+}
+
+/* ── @media print additions for A3 single-page ─────────────────────────────── */
+
+@media print {
+  /* Trade Schedule: expand scroll container in print */
+  [data-widget="trade-schedule"] {
+    overflow: visible !important;
+    max-height: none !important;
+    height: auto !important;
+  }
+
+  /* Trade row: widen label column */
+  [data-trade-row] {
+    grid-template-columns: 80px 1fr 46px !important;
+  }
+
+  /* Trade label: allow wrap */
+  [data-trade-row] .truncate {
+    overflow: visible !important;
+    text-overflow: clip !important;
+    white-space: normal !important;
+  }
+
+  /* Hide scrollbar chrome in Trade Schedule */
+  [data-widget="trade-schedule"] ::-webkit-scrollbar {
+    display: none !important;
+  }
+}
+
+/* ── Weekly Report print styles ─────────────────────────────────────────────
+   Activated by html.weekly-report-printing, set on mount and cleared on unmount
+   of WeeklyReportForm (so Ctrl+P also works).
+
+   Named @page rules live in the static stylesheet — dynamically injected
+   <style> @page rules are silently ignored by Chromium.
+   The default @page above is already A4 portrait 14mm/13mm so cover/toc/sections
+   that DON'T set `page:` explicitly already get the right size.
+   Landscape appendix sections set `page: wr-landscape` to switch to A4 landscape.
+
+   These elements do NOT carry the .print-page class, so the dashboard
+   break-after:page / break-inside:avoid rules never touch them. */
+
+@media print {
+  /* ── Scale the root font-size so all rem-based Tailwind classes shrink.
+     Browser default is 16px; 10px ≈ 62.5% — this makes text-sm (0.875rem)
+     render at ~8.75px, matching the reference's density. */
+  html.weekly-report-printing {
+    font-size: 10px !important;
+  }
+
+  /* ── When printing the weekly report: neutralise the App shell ──
+     The report lives inside:
+       div.flex.h-screen  (outer flex row)
+         aside.no-print   (sidebar — hidden by existing .no-print rule)
+         div.flex.flex-col.flex-1  (right column)
+           header.no-print
+           main.print-main  (scrollable content area — THIS holds the report)
+           footer.no-print
+     The right column (div.flex.flex-col.flex-1) is still a flex child; its
+     flex-basis / width squeezes the report. Turn it all into plain block flow
+     and hide everything except the report content. */
+  /* Force white on html itself — kills any body/html background bleed */
+  html.weekly-report-printing {
+    background: #fff !important;
+    min-height: 0 !important;
+  }
+
+  html.weekly-report-printing body {
+    background: #fff !important;
+    font-size: 10pt !important;
+    min-height: 0 !important;
+  }
+
+  /* Flatten every ancestor of the report into normal block flow.
+     bg-gray-100 on the outer shell div (div.flex.h-screen) is the grey
+     rectangle that paints through wherever the white section box does not
+     cover the page — force white on every ancestor wrapper. */
+  html.weekly-report-printing #root,
+  html.weekly-report-printing .flex.h-screen,
+  html.weekly-report-printing .flex.flex-col.flex-1,
+  html.weekly-report-printing .print-main {
+    display: block !important;
+    width: 100% !important;
+    height: auto !important;
+    min-height: 0 !important;
+    max-height: none !important;
+    overflow: visible !important;
+    padding: 0 !important;
+    margin: 0 !important;
+    position: static !important;
+    transform: none !important;
+    flex: none !important;
+    background: #fff !important;
+  }
+
+  /* Hide the sidebar and the in-report sticky nav (aside.no-print is already
+     hidden by the global .no-print rule, but be explicit) */
+  html.weekly-report-printing aside,
+  html.weekly-report-printing header,
+  html.weekly-report-printing footer,
+  html.weekly-report-printing .no-print {
+    display: none !important;
+  }
+
+  /* ── Page assignments ── */
+  /* Cover, TOC and portrait sections inherit the default @page (A4 portrait) */
+  html.weekly-report-printing .weekly-report-section.print-landscape {
+    page: wr-landscape;
+  }
+
+  /* ── Cover — all sizes are px inline styles in the TSX, no rem, no font-size reset needed ── */
+  html.weekly-report-printing .weekly-report-cover {
+    border-radius: 0 !important;
+    box-shadow: none !important;
+    break-after: page;
+    page-break-after: always;
+    padding: 35mm 20mm !important;
+    margin: 0 !important;
+    min-height: 100vh !important;
+    height: 100vh !important;
+    overflow: hidden !important;
+    background: #172642 !important;
+    print-color-adjust: exact;
+    -webkit-print-color-adjust: exact;
+  }
+
+  /* ── TOC (mirrors reference .toc) ── */
+  html.weekly-report-printing .weekly-report-toc {
+    display: block !important;
+    border: 0 !important;
+    border-radius: 0 !important;
+    box-shadow: none !important;
+    break-after: page;
+    page-break-after: always;
+    padding: 25px 30px !important;
+    margin: 0 !important;
+  }
+
+  /* ── Sections (mirrors reference .section) ── */
+  html.weekly-report-printing .weekly-report-section {
+    display: block !important;
+    border: 0 !important;
+    border-radius: 0 !important;
+    box-shadow: none !important;
+    break-before: page;
+    page-break-before: always;
+    padding: 0 !important;
+    margin: 0 !important;
+    overflow: visible !important;
+    width: 100% !important;
+  }
+
+  /* Landscape sections need explicit width: the A4 landscape printable area
+     is 297mm − 2×12mm = 273mm ≈ 1030px at 96dpi */
+  html.weekly-report-printing .weekly-report-section.print-landscape {
+    width: 273mm !important;
+    max-width: none !important;
+  }
+
+  /* Section header top padding (mirrors reference .section-head) */
+  html.weekly-report-printing .weekly-report-section > div:first-child {
+    padding-top: 5mm !important;
+  }
+
+  /* ── Block-level content — keep non-table blocks together; tables may flow ── */
+  html.weekly-report-printing .wr-block {
+    /* No break-inside: avoid here — table blocks must be able to flow across pages */
+  }
+
+  /* Non-table blocks: keep together (charts, KPI cards, callouts, paragraphs) */
+  html.weekly-report-printing .wr-block:not(.wr-block-table) {
+    break-inside: avoid;
+    page-break-inside: avoid;
+  }
+
+  /* ── Tables: flow across pages freely; only individual rows stay intact ── */
+  html.weekly-report-printing .table-wrap {
+    overflow: visible !important;
+    border-radius: 0 !important;
+    border: 0 !important;
+    /* No break-inside: avoid — allow the table to span multiple pages */
+  }
+
+  html.weekly-report-printing .table-wrap table {
+    font-size: 7.5pt !important;
+    width: 100% !important;
+    border-collapse: collapse !important;
+    table-layout: auto !important;
+    word-break: break-word !important;
+    /* No break-inside: avoid — table may span pages */
+  }
+
+  html.weekly-report-printing .table-wrap th,
+  html.weekly-report-printing .table-wrap td {
+    padding: 4px 5px !important;
+    word-break: break-word !important;
+    overflow-wrap: anywhere !important;
+  }
+
+  html.weekly-report-printing .table-wrap thead {
+    display: table-header-group !important;
+  }
+
+  /* Only rows must not split — individual cells stay on one page */
+  html.weekly-report-printing .table-wrap tr {
+    break-inside: avoid;
+    page-break-inside: avoid;
+  }
+
+  /* ── Details/footnotes: open them ── */
+  html.weekly-report-printing details {
+    display: block !important;
+  }
+
+  html.weekly-report-printing details > :not(summary) {
+    display: block !important;
+  }
+
+  /* ── Density overrides — match reference scale ── */
+
+  /* KPI cards: 5 per row */
+  html.weekly-report-printing .wr-kpi-grid {
+    grid-template-columns: repeat(5, minmax(0, 1fr)) !important;
+    gap: 6px !important;
+  }
+
+  /* Reduce block bottom margin (applies to all block types) */
+  html.weekly-report-printing .wr-block,
+  html.weekly-report-printing .wr-block-table {
+    margin-bottom: 8px !important;
+  }
+
+  /* Cap chart height so charts don't dominate pages */
+  html.weekly-report-printing .print-chart svg {
+    max-height: 200px !important;
+  }
+
+  /* Hardcoded text-[10px] and text-[11px] — keep them small in print */
+  html.weekly-report-printing [class*="text-\\[10px\\]"],
+  html.weekly-report-printing [class*="text-\\[11px\\]"] {
+    font-size: 7pt !important;
+  }
+
+  /* Section head: tighten top padding */
+  html.weekly-report-printing .weekly-report-section > div:first-child {
+    padding-top: 4mm !important;
+    padding-bottom: 2mm !important;
+  }
+
+  /* KPI card inner padding */
+  html.weekly-report-printing .wr-kpi-card {
+    padding: 6px 8px !important;
+  }
+
+  /* Callout/finding boxes */
+  html.weekly-report-printing .wr-callout {
+    padding: 6px 10px !important;
+    margin-bottom: 6px !important;
+  }
+}
+
+/* Report dashboard nav — left-accent active state (enterprise style) */
+.report-nav-item {
+  color: #4b5563;
+  transition: background 0.15s, color 0.15s, border-color 0.15s;
+}
+.report-nav-item:hover {
+  background: #f9fafb;
+  color: #111827;
+}
+.report-nav-item.active {
+  background: #eff6ff;
+  color: #1d4ed8;
+  font-weight: 600;
+  border-left-color: #2563eb;
+}
+
+/* Filters participate in card sizing rather than shrinking between charts. */
+.chart-filters {
+  position: relative;
+  flex-shrink: 0;
+  min-height: 30px;
+  padding-block: 4px;
+  margin-bottom: 8px;
+}
+.chart-filters select { max-width: 100%; min-height: 26px; }
+
+/* Fixed A3 overview: a tall register cannot resize every other card. */
+.a3-grid-area { flex: 1; min-height: 0; }
+.a3-region-grid { height: 100%; }
+.a3-heading { border-bottom: 1px solid #d5dced; }
+.a3-heading svg { display: none; }
+.a3-region-title { font-size: 11px; color: #102746 !important; }
+.a3-widget-slot { flex: 1; min-height: 0; min-width: 0; }
+.a3-widget-stack, .a3-widget-stack-item { display: flex; flex-direction: column; flex: 1; min-height: 0; }
+.a3-widget-stack { gap: 4px; }
+.a3-widget-stack-item > .border-t { margin: 0 0 3px; }
+.a3-widget-slot > .no-print, .a3-widget-slot .chart-filters { display: none; }
+.a3-empty { height: 100%; display: flex; flex-direction: column; justify-content: center; align-items: center; gap: 5px; background: #f8faff; color: #60718b; text-align: center; font-size: 10px; padding: 8px; }
+.a3-empty span { font-size: 9px; }
+.a3-kpis { height: 100%; display: grid; gap: 5px; }
+.a3-kpi { border-radius: 4px; padding: 5px; display: flex; flex-direction: column; justify-content: center; gap: 3px; min-width: 0; }
+.a3-kpi > span { font-size: 10px; color: #60718b; }
+.a3-kpi > strong { font-size: 18px; line-height: 1.2; }
+.a3-kpi small { font-size: 9px; color: #60718b; line-height: 1.1; }
+.a3-record { margin: 0; font-size: 9px; line-height: 1.2; height: 100%; display: flex; flex-direction: column; }
+.a3-record > div { display: flex; justify-content: space-between; gap: 6px; border-bottom: 1px solid #e5eaf5; flex: 1; min-height: 0; align-items: center; }
+.a3-record dt { color: #60718b; }
+.a3-record dd { font-weight: 600; text-align: right; overflow-wrap: anywhere; }
+.a3-table-summary { font-size: 9px; }
+.a3-table-summary table { width: 100%; table-layout: fixed; }
+.a3-table-summary th, .a3-table-summary td { font-size: 9px; line-height: 1.2; padding: 2px; text-align: left; overflow-wrap: anywhere; border-bottom: 1px solid #e5eaf5; }
+.a3-table-summary p { margin-top: 3px; color: #60718b; }
+.a3-trades { height: 100%; display: flex; flex-direction: column; justify-content: space-evenly; font-size: 9px; }
+.a3-trades > div { display: grid; grid-template-columns: 100px 1fr; gap: 5px; align-items: center; }
+.a3-trade-track { height: 4px; background: #eef0f7; margin-block: 2px; }
+.a3-trade-track > div { height: 100%; }
+.a3-photo { height: 100%; display: flex; align-items: center; gap: 10px; font-size: 10px; }
+.a3-photo img { width: 50%; height: 100%; object-fit: contain; }
+.a3-footer { flex-shrink: 0; background: transparent !important; border-top: 1px solid #d5dced; }
+.a3-table-summary td > span { display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; }
+.a3-record dt, .a3-record dd { font-size: 9px; line-height: 1; }
+.a3-donut { height: 100%; display: flex; align-items: center; }
+.a3-donut-chart { height: 100%; width: 55%; }
+.a3-donut-legend { width: 45%; font-size: 9px; }
+.a3-donut-legend > div { display: flex; align-items: center; gap: 4px; margin-block: 3px; }
+.a3-donut-legend i { width: 6px; height: 6px; flex-shrink: 0; }
+.a3-donut-legend strong { margin-left: auto; }
+
+/* The screen dashboard retains its original rendering. Only the print lifecycle
+   reveals the fixed physical sheet and its compact reference-style widgets. */
+.a3-print-sheet { display: none !important; }
+html.a3-printing .a3-print-sheet { display: flex !important; }
+html.a3-printing .a3-screen-page { display: none !important; }
+.a3-print-sheet .a3-heading { height: 12mm; padding: 0 0 1.5mm; margin-bottom: 1.5mm; }
+.a3-print-sheet .a3-footer { height: 8mm; padding: 0; margin-top: 1.5mm; }
+.a3-print-sheet .a3-region-grid { gap: 1.5mm; }
+.a3-print-sheet .a3-region-title { font-size: 8pt; }
+.a3-print-sheet .a3-kpi > strong { font-size: 12.4pt; }
+@media print {
+  .a3-screen-page { display: none !important; }
+  .a3-print-sheet { display: flex !important; }
+}
+
+/* Keep the PDF edge clear; the screen dashboard retains its canvas colour. */
+html.a3-printing body,
+html.a3-printing #root,
+html.a3-printing .a3-print-root,
+html.a3-printing .a3-print-sheet { background: #fff !important; }
+@media print {
+  .a3-print-sheet { background: #fff !important; }
+}
+
+/* Preserve main's screen preview shadow without applying it to the PDF. */
+.a3-screen-page { box-shadow: 0 18px 65px rgba(31, 40, 80, 0.2); }
+
+/* Dashboard design_specification supplies visual tokens; a3_layout retains
+   control of grid positions, row heights and the user-selected print inset. */
+.dashboard-design .dashboard-panel {
+  background: var(--design-surface-primary) !important;
+  border-color: var(--design-subtle-border) !important;
+  border-radius: var(--design-widget-radius) !important;
+}
+.dashboard-design .a3-screen-page .dashboard-panel { padding: var(--design-widget-padding) !important; }
+.dashboard-design .dashboard-panel-title,
+.dashboard-design .a3-region-title {
+  color: var(--design-text-primary) !important;
+  font-size: var(--design-widget-title-size) !important;
+  font-weight: var(--design-widget-title-weight) !important;
+}
+.dashboard-design .dashboard-kpi-label {
+  color: var(--design-text-secondary) !important;
+  font-size: var(--design-kpi-label-size) !important;
+  font-weight: var(--design-kpi-label-weight) !important;
+}
+.dashboard-design .dashboard-kpi-value {
+  color: var(--design-text-primary) !important;
+  font-size: var(--design-kpi-value-size) !important;
+  font-weight: var(--design-kpi-value-weight) !important;
+}
+.dashboard-design .dashboard-kpi-card,
+.dashboard-design .a3-kpi { border-radius: var(--design-kpi-radius) !important; }
+.dashboard-design .recharts-cartesian-axis-tick text { fill: var(--design-chart-axis-label); font-family: inherit; }
+.dashboard-design .recharts-cartesian-grid line { stroke: var(--design-chart-gridline); }
+.dashboard-design .a3-screen-page .recharts-cartesian-axis-tick text { font-size: var(--design-chart-axis-label-size); }
+.dashboard-design .a3-screen-page .recharts-legend-wrapper { font-size: var(--design-chart-legend-size) !important; }
+.dashboard-design .a3-screen-page table td { font-size: var(--design-table-body-size) !important; color: var(--design-text-primary); }
+.dashboard-design .a3-screen-page table th { font-size: var(--design-table-header-size) !important; color: var(--design-text-secondary); }
+.dashboard-design .a3-screen-page { background: var(--design-canvas) !important; }
+.dashboard-design .a3-print-sheet .a3-region-title { font-size: var(--design-print-section-title) !important; }
+.dashboard-design .a3-print-sheet .a3-kpi > span { font-size: var(--design-print-kpi-label); color: var(--design-text-secondary); }
+.dashboard-design .a3-print-sheet .a3-kpi > strong { font-size: var(--design-print-kpi-value); color: var(--design-text-primary) !important; }
+.dashboard-design .a3-print-sheet .a3-kpi small { color: var(--design-text-secondary); }
+.dashboard-design .a3-print-sheet .a3-heading .text-lg { font-size: var(--design-print-page-title); }
+.dashboard-design .a3-print-sheet .a3-record dt,
+.dashboard-design .a3-print-sheet .a3-record dd,
+.dashboard-design .a3-print-sheet .a3-table-summary td { font-size: var(--design-print-table-body); }
+.dashboard-design .a3-print-sheet .a3-table-summary th { font-size: var(--design-print-table-header); }
+.dashboard-design .a3-print-sheet .a3-donut-legend { font-size: var(--design-print-chart-legend); }
+html.a3-printing .dashboard-design .dashboard-panel { box-shadow: none !important; }
+@media print { .dashboard-design .dashboard-panel { box-shadow: none !important; } }
+.dashboard-design .a3-screen-page .recharts-line-curve { stroke-width: var(--design-chart-line-width); }
+.dashboard-design .a3-print-sheet .recharts-line-curve { stroke-width: var(--design-print-line-width); }
+.dashboard-design .a3-screen-page .dashboard-kpi-card { padding: var(--design-kpi-padding) !important; min-height: var(--design-kpi-min-height); }
+.dashboard-design .a3-kpi { background: var(--design-surface-primary) !important; border: 1px solid var(--design-subtle-border); }
+.dashboard-design .a3-screen-page .dashboard-panel { box-shadow: var(--design-card-shadow) !important; }
+.dashboard-design .text-red-500, .dashboard-design .text-red-600 { color: var(--design-critical); }
+.dashboard-design .text-amber-600 { color: var(--design-warning); }
+.dashboard-design .text-green-600 { color: var(--design-success); }
+
+/* Weekly report styles are supplied by the selected schema's approved design. */
+.weekly-report-themed .weekly-report-section,
+.weekly-report-themed .weekly-report-toc { background: var(--wr-page-background) !important; color: var(--wr-dark-neutral); }
+.weekly-report-themed .weekly-report-cover { background: var(--wr-cover-bg) !important; color: var(--wr-dark-neutral) !important; border-left: 6pt solid var(--wr-primary); }
+.weekly-report-themed .weekly-report-cover h1 { color: var(--wr-primary) !important; }
+.weekly-report-themed .weekly-report-cover h2 { color: var(--wr-secondary) !important; }
+.weekly-report-themed .weekly-report-cover strong { color: var(--wr-dark-neutral) !important; }
+.weekly-report-themed .weekly-report-cover span,
+.weekly-report-themed .weekly-report-cover > div:first-child { color: var(--wr-medium-neutral) !important; }
+.weekly-report-themed .weekly-report-cover > div:last-child { border-color: var(--wr-light-neutral) !important; }
+.weekly-report-themed .weekly-report-section > div:first-child { border-left: var(--wr-section-accent) solid var(--wr-primary); padding-left: 8pt; border-bottom-color: var(--wr-light-neutral); }
+.weekly-report-themed .weekly-report-section h2,
+.weekly-report-themed .weekly-report-toc h2 { color: var(--wr-primary); font-size: var(--wr-h1-font); }
+.weekly-report-themed .weekly-report-section h3 { color: var(--wr-primary); font-size: var(--wr-h2-font); }
+.weekly-report-themed .wr-block p { color: var(--wr-dark-neutral); font-size: var(--wr-body-font); margin-bottom: var(--wr-paragraph-gap); }
+.weekly-report-themed .wr-kpi-grid { grid-template-columns: repeat(var(--wr-kpi-columns), minmax(0, 1fr)) !important; }
+.weekly-report-themed .wr-kpi-card { background: var(--wr-kpi-bg) !important; border-color: var(--wr-kpi-border) !important; border-radius: var(--wr-kpi-radius) !important; padding: var(--wr-kpi-padding) !important; min-height: var(--wr-kpi-min-height); }
+.weekly-report-themed .wr-kpi-card > span:first-child { font-size: var(--wr-kpi-label-font); color: var(--wr-medium-neutral); }
+.weekly-report-themed .wr-kpi-value { font-size: var(--wr-kpi-value-font); }
+.weekly-report-themed [data-status="adverse"] { color: var(--wr-negative); }
+.weekly-report-themed [data-status="positive"] { color: var(--wr-positive); }
+.weekly-report-themed [data-status="caution"] { color: var(--wr-warning); }
+.weekly-report-themed .wr-block-table { margin-bottom: var(--wr-table-gap); }
+.weekly-report-themed table th { background: var(--wr-table-header) !important; color: var(--wr-table-header-text) !important; font-size: var(--wr-table-header-font) !important; }
+.weekly-report-themed table td { color: var(--wr-dark-neutral); font-size: var(--wr-table-body-font) !important; }
+.weekly-report-themed table th,
+.weekly-report-themed table td { padding: var(--wr-table-padding) !important; border-color: var(--wr-table-border) !important; }
+.weekly-report-themed table tbody tr:nth-child(even) { background: var(--wr-table-stripe) !important; }
+.weekly-report-themed .wr-callout > p:first-child { color: var(--wr-callout-title, var(--wr-dark-neutral)); }
+.weekly-report-themed .wr-block:has(figure) { margin-bottom: var(--wr-chart-gap); }
+.weekly-report-themed .text-indigo-600,
+.weekly-report-themed .text-indigo-500 { color: var(--wr-primary); }
+.weekly-report-themed .bg-indigo-600 { background: var(--wr-primary); }
+@media screen and (max-width: 640px) { .weekly-report-themed .wr-kpi-grid { grid-template-columns: repeat(2, minmax(0, 1fr)) !important; } }
+@media print {
+  html.weekly-report-printing .weekly-report-themed .weekly-report-cover { background: var(--wr-cover-bg) !important; }
+  html.weekly-report-printing .weekly-report-themed .weekly-report-section table td { font-size: var(--wr-table-body-font) !important; }
+  html.weekly-report-printing .weekly-report-themed .weekly-report-section table th { font-size: var(--wr-table-header-font) !important; }
+}
+.weekly-report-themed table td[data-numeric="true"] { text-align: right; }
+.weekly-report-themed table tbody tr { height: var(--wr-table-row-height); }
+.weekly-report-themed table thead tr { height: var(--wr-table-head-height); }
+.weekly-report-themed table td, .weekly-report-themed table th { border-bottom-width: var(--wr-table-border-width); }
+@media print { .weekly-report-themed table thead { display: var(--wr-table-head-display) !important; } }
+/* Centre figures only in the shop-drawing discipline distribution. */
+.weekly-report-themed .wr-discipline-distribution table th:not(:first-child),
+.weekly-report-themed .wr-discipline-distribution table td:not(:first-child) { text-align: center !important; }
